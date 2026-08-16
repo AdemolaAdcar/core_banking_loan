@@ -1,0 +1,185 @@
+openapi: 3.1.0
+info:
+  title: Payment Execution API
+  version: 0.3.0
+  description: >
+    Owns execution of money movement over external payment rails. Never writes
+    a JournalEntry itself — GLPostingAPI posting always happens first
+    (AccountAPI confirms the GL post before calling this API for an outbound
+    instruction), and this service only reports outcomes back via domain
+    events. Retrofitted to the API/Event Spec Agent's conventions (v0.3.0,
+    BREAKING from v0.2.0): Money is now the shared {amount, currency} object;
+    the idempotency key moves from a `disbursementId` body field to a required
+    `Idempotency-Key` header; PaymentInstruction is now a shared JSON Schema
+    object (../schemas/payment-instruction.schema.json) referenced via $ref.
+  x-adapter: PaymentAdapter
+  x-epics: [CB-DISB]
+  x-req-ids:
+    - REQ-CB-DISB-004
+
+servers:
+  - url: https://pay.internal.core-banking.example/v1
+    description: Payment Execution — internal service network only
+
+security:
+  - serviceAuth: []
+
+paths:
+  /payment-instructions:disburse:
+    post:
+      operationId: initiateDisbursement
+      summary: Execute an outbound disbursement payment to a borrower's designated account
+      description: >
+        REQ-CB-DISB-004. Called by AccountAPI only after GLPostingAPI has
+        confirmed the PR-DISB-01 funding entry. Idempotent on the
+        `Idempotency-Key` header: a retried or duplicate call with the same key
+        returns the original PaymentInstruction and never re-executes the
+        transfer — a reused key with a materially different payload returns
+        409. Acknowledges submission only (202) — the terminal outcome
+        (executed or failed/returned) is always delivered asynchronously via
+        the payment.disbursement.confirmed / payment.disbursement.failed
+        events, never inferred from this response.
+      tags: [Disbursement Payment]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InitiateDisbursementRequest'
+            examples:
+              standard:
+                value:
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  partyId: "9c8d2e3f-4a5b-6c7d-8b3a-1e2f3a4b5c6d"
+                  journalEntryId: "3f2a9e2e-6b1a-4c9d-8b3a-1e2f3a4b5c6d"
+                  amount: { amount: 1500000, currency: USD }
+      responses:
+        '202':
+          description: Submission accepted; outcome to follow via payment.disbursement.confirmed or payment.disbursement.failed
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/payment-instruction.schema.json#/$defs/PaymentInstruction'
+        '200':
+          description: Idempotent replay — original PaymentInstruction returned, nothing re-submitted
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/payment-instruction.schema.json#/$defs/PaymentInstruction'
+        '400':
+          description: journalEntryId does not correspond to a confirmed PR-DISB-01 entry, or a Money field is malformed
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /payment-instructions/{instructionId}:
+    get:
+      operationId: getPaymentInstruction
+      summary: Retrieve current payment instruction status (polling fallback)
+      tags: [Disbursement Payment]
+      parameters:
+        - name: instructionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Current instruction state
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/payment-instruction.schema.json#/$defs/PaymentInstruction'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Same value the originating AccountAPI disbursement request used as its own Idempotency-Key.
+      schema:
+        type: string
+
+  securitySchemes:
+    serviceAuth:
+      type: oauth2
+      description: OAuth2 client-credentials grant, internal service network + mTLS at the transport layer
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.internal.core-banking.example/oauth2/token
+          scopes:
+            payment-execution:disbursement:write: Submit disbursement payments
+            payment-execution:disbursement:read: Read payment instruction status
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Unauthorized:
+      description: Missing or invalid access token
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Forbidden:
+      description: Token valid but missing the required scope
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    InternalServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+
+  schemas:
+    InitiateDisbursementRequest:
+      type: object
+      required: [loanAccountId, partyId, journalEntryId, amount]
+      properties:
+        loanAccountId:
+          type: string
+          format: uuid
+        partyId:
+          type: string
+          format: uuid
+          description: Resolved to the borrower's designated payout account inside PaymentAPI's own store — never included here
+        journalEntryId:
+          type: string
+          format: uuid
+          description: The confirmed PR-DISB-01 entry that authorizes this payment
+        amount:
+          $ref: '../schemas/money.schema.json#/$defs/Money'

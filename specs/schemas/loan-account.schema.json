@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://core-banking.internal.example/schemas/loan-account.schema.json",
+  "title": "LoanAccount",
+  "$defs": {
+    "TermSet": {
+      "type": "object",
+      "required": ["principalAmount", "annualInterestRateBps", "termMonths", "dayCountConvention"],
+      "properties": {
+        "principalAmount": { "$ref": "money.schema.json#/$defs/Money" },
+        "annualInterestRateBps": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Basis points (e.g. 1499 for 14.99%) — integer, same rationale as Money.amount avoiding float rate math."
+        },
+        "termMonths": { "type": "integer", "exclusiveMinimum": 0 },
+        "dayCountConvention": {
+          "type": "string",
+          "enum": ["ACTUAL_365", "ACTUAL_360", "THIRTY_360"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "TermVersion": {
+      "description": "Immutable once created — a modification never edits a TermVersion, it appends a new one with a later effectiveDate.",
+      "allOf": [
+        { "$ref": "#/$defs/TermSet" },
+        {
+          "type": "object",
+          "required": ["version", "effectiveDate"],
+          "properties": {
+            "version": { "type": "integer", "minimum": 1 },
+            "effectiveDate": { "type": "string", "format": "date" }
+          }
+        }
+      ]
+    },
+    "LoanAccount": {
+      "type": "object",
+      "required": ["loanAccountId", "approvalReferenceId", "partyId", "status", "currentTermVersion", "bookedBy", "dpd", "dpdBucket", "nonAccrualFlag", "createdAt", "updatedAt"],
+      "properties": {
+        "loanAccountId": { "type": "string", "format": "uuid" },
+        "approvalReferenceId": { "type": "string", "format": "uuid" },
+        "partyId": { "type": "string", "format": "uuid" },
+        "status": {
+          "type": "string",
+          "enum": ["Approved", "PendingDisbursement", "Disbursed", "Closed", "ChargedOff"],
+          "description": "Coarse lifecycle stage, deliberately separate from delinquency: an account stays \"Disbursed\" while past due — see dpd/dpdBucket/nonAccrualFlag for the finer-grained overlay maintained daily on top of it."
+        },
+        "currentTermVersion": { "$ref": "#/$defs/TermVersion" },
+        "bookedBy": { "type": "string" },
+        "dpd": { "type": "integer", "minimum": 0, "description": "Consecutive calendar days past due; 0 when current." },
+        "dpdBucket": { "type": "string", "enum": ["Current", "1-29", "30-59", "60-89", "90+"] },
+        "nonAccrualFlag": {
+          "type": "boolean",
+          "description": "Set by the daily delinquency assessment when dpd crosses the non-accrual threshold; read by the daily accrual job's eligibility exclusion."
+        },
+        "nonAccrualSince": {
+          "type": ["string", "null"],
+          "format": "date",
+          "description": "Effective date the flag was set; retained for reporting even if the account later cures."
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

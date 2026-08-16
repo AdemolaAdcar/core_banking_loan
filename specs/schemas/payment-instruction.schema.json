@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://core-banking.internal.example/schemas/payment-instruction.schema.json",
+  "title": "PaymentInstruction",
+  "$defs": {
+    "PaymentInstruction": {
+      "type": "object",
+      "required": ["instructionId", "loanAccountId", "direction", "amount", "purpose", "status"],
+      "properties": {
+        "instructionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Equal to the Idempotency-Key the initiating caller sent — no separate ID space."
+        },
+        "loanAccountId": { "type": "string", "format": "uuid" },
+        "direction": {
+          "type": "string",
+          "enum": ["OUTBOUND", "INBOUND"],
+          "description": "OUTBOUND = money PaymentAPI sends out (disbursement). INBOUND = money PaymentAPI received and is notifying AccountAPI about (repayment/payoff receipt) via receiveRepaymentNotification."
+        },
+        "purpose": {
+          "type": "string",
+          "enum": ["DISBURSEMENT", "REPAYMENT", "PAYOFF"]
+        },
+        "amount": { "$ref": "money.schema.json#/$defs/Money" },
+        "partyId": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "Destination party for OUTBOUND; null for INBOUND (payer identity stays inside PaymentAPI's own store, never surfaced here)."
+        },
+        "journalEntryId": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "The GLPostingAPI entry that authorizes (OUTBOUND) or resulted from (INBOUND) this instruction. Reference only — GLPostingAPI remains the sole source of truth for the entry itself."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["Submitted", "Executed", "Failed", "Returned"]
+        },
+        "rail": { "type": ["string", "null"] },
+        "failureReason": {
+          "type": ["string", "null"],
+          "enum": ["PAYMENT_RETURNED", "PAYMENT_FAILED", "RAIL_REJECTED", null]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

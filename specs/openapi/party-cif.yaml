@@ -1,0 +1,110 @@
+openapi: 3.1.0
+info:
+  title: Party / CIF API
+  version: 0.3.0
+  description: >
+    Owns party (customer) identity, status, and KYC state. Retrofitted to the
+    API/Event Spec Agent's conventions (v0.3.0, breaking from v0.2.0): Party is
+    now a shared JSON Schema object (../schemas/party.schema.json), referenced
+    via $ref rather than declared inline. Defines only the single read path
+    both CB-BOOK (pre-booking validation, REQ-CB-BOOK-002) and CB-DISB
+    (pre-disbursement validation, REQ-CB-DISB-002) depend on. This operation is
+    read-only and never affects a balance, so it carries no Idempotency-Key
+    requirement.
+  x-adapter: PartyAdapter
+  x-epics: [CB-BOOK, CB-DISB]
+  x-req-ids:
+    - REQ-CB-BOOK-002
+    - REQ-CB-DISB-002
+
+servers:
+  - url: https://party.internal.core-banking.example/v1
+    description: Party/CIF — internal service network only
+
+security:
+  - serviceAuth: []
+
+paths:
+  /parties/{partyId}:
+    get:
+      operationId: getParty
+      summary: Retrieve current party status and KYC state
+      description: >
+        Called synchronously by AccountAPI at two points in the loan lifecycle:
+        REQ-CB-BOOK-002 (immediately before booking) and REQ-CB-DISB-002
+        (immediately before posting a disbursement, to confirm the party is
+        still Active and KYC is still Verified at the moment of funding —
+        deliberately re-checked rather than trusted from booking time).
+      tags: [Party]
+      parameters:
+        - name: partyId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Current party state
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/party.schema.json#/$defs/Party'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    serviceAuth:
+      type: oauth2
+      description: OAuth2 client-credentials grant, internal service network + mTLS at the transport layer
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.internal.core-banking.example/oauth2/token
+          scopes:
+            party:read: Read party status and KYC state
+
+  responses:
+    BadRequest:
+      description: Malformed request (e.g. partyId not a valid UUID)
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Unauthorized:
+      description: Missing or invalid access token
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Forbidden:
+      description: Token valid but missing the required scope
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Conflict:
+      description: Idempotency-Key reused with a materially different payload
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    UnprocessableEntity:
+      description: Request well-formed but semantically invalid
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    InternalServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }

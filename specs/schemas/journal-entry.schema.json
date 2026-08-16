@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://core-banking.internal.example/schemas/journal-entry.schema.json",
+  "title": "JournalEntry",
+  "$defs": {
+    "JournalEntryLine": {
+      "type": "object",
+      "required": ["glAccount", "direction", "amount", "runningBalanceAfter"],
+      "properties": {
+        "glAccount": {
+          "type": "string",
+          "description": "e.g. 1200-LoanReceivable, 1010-CashNostro, 1300-InterestReceivable, 1400-FeeReceivable, 4100-InterestIncome, 4200-FeeIncome, 1900-AllowanceForLoanLosses, 4300-RecoveryIncome"
+        },
+        "direction": { "type": "string", "enum": ["DEBIT", "CREDIT"] },
+        "amount": { "$ref": "money.schema.json#/$defs/Money" },
+        "runningBalanceAfter": {
+          "$ref": "money.schema.json#/$defs/Money",
+          "description": "Computed running balance of glAccount for this loan account immediately after this line posts — callers never need a separate read to confirm the posting effect."
+        }
+      },
+      "additionalProperties": false
+    },
+    "JournalEntry": {
+      "type": "object",
+      "required": ["journalEntryId", "sourceEventId", "postingRuleCode", "lines", "balanced", "immutable", "postedAt"],
+      "properties": {
+        "journalEntryId": { "type": "string", "format": "uuid" },
+        "sourceEventId": {
+          "type": "string",
+          "description": "Populated from the caller's Idempotency-Key header value. Every JournalEntry is keyed on this — never reused across two logically different postings."
+        },
+        "postingRuleCode": { "type": "string" },
+        "loanAccountId": { "type": "string", "format": "uuid" },
+        "lines": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/JournalEntryLine" },
+          "description": "Server-derived; sum of DEBIT line amounts always equals sum of CREDIT line amounts, per currency."
+        },
+        "balanced": { "type": "boolean", "const": true },
+        "immutable": {
+          "type": "boolean",
+          "const": true,
+          "description": "There is no update or delete operation for this resource. Corrections are always a new, separate entry with a new sourceEventId."
+        },
+        "postedAt": { "type": "string", "format": "date-time" },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Rule-specific audit context. See GLPostingAPI's PostingRuleCode catalog for which rules require it and what it must carry."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Income-recognition principle governing every posting rule in this catalog: income accounts (InterestIncome, FeeIncome) are credited exactly once, at accrual or assessment time (PR-ACCR-01, PR-DELINQ-01). Every subsequent cash-collection entry (PR-REPAY-01, PR-PAYOFF-01) clears Cash against the corresponding Receivable account (InterestReceivable, FeeReceivable, LoanReceivable) — it never re-credits Income. The one legitimate exception is a waiver (PR-DELINQ-02), which reverses Income directly because it undoes the original recognition rather than collecting against it."
+    }
+  }
+}

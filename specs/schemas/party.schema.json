@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://core-banking.internal.example/schemas/party.schema.json",
+  "title": "Party",
+  "$defs": {
+    "Party": {
+      "type": "object",
+      "required": ["partyId", "status", "kycStatus", "updatedAt"],
+      "properties": {
+        "partyId": { "type": "string", "format": "uuid" },
+        "status": {
+          "type": "string",
+          "enum": ["Active", "Blocked", "Closed", "Inactive"]
+        },
+        "kycStatus": {
+          "type": "string",
+          "enum": ["Verified", "Unverified", "Expired"]
+        },
+        "displayName": {
+          "type": "string",
+          "x-pii": true,
+          "description": "Present only on operations that explicitly need it for human display (e.g. CRM). Omitted from every balance/posting-adjacent payload."
+        },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

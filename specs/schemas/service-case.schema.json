@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://core-banking.internal.example/schemas/service-case.schema.json",
+  "title": "ServiceCase",
+  "$defs": {
+    "Interaction": {
+      "type": "object",
+      "required": ["interactionId", "loanAccountId", "eventType", "occurredAt"],
+      "properties": {
+        "interactionId": { "type": "string", "format": "uuid" },
+        "loanAccountId": { "type": "string", "format": "uuid" },
+        "eventType": {
+          "type": "string",
+          "enum": [
+            "ACCOUNT_BOOKED", "ACCOUNT_DISBURSED", "REPAYMENT_POSTED",
+            "DELINQUENCY_STATUS_CHANGED", "ACCOUNT_CLOSED", "ACCOUNT_CHARGED_OFF",
+            "TERMS_MODIFIED"
+          ],
+          "description": "Mirrors the CRM-facing domain events published by other modules — logInteraction is CRM's write path for exactly those events, never a general-purpose note field for balance data."
+        },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "notes": {
+          "type": "string",
+          "description": "Free-text, non-balance annotation only. No Money field exists anywhere in this schema, under any circumstance — enforced at spec-review, not code review."
+        }
+      },
+      "additionalProperties": false
+    },
+    "ServiceCase": {
+      "type": "object",
+      "required": ["caseId", "partyId", "status", "reasonCode", "openedAt", "updatedAt"],
+      "properties": {
+        "caseId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Equal to the Idempotency-Key the caller sent on openCase."
+        },
+        "loanAccountId": { "type": ["string", "null"], "format": "uuid" },
+        "partyId": { "type": "string", "format": "uuid" },
+        "status": { "type": "string", "enum": ["Open", "InProgress", "Resolved", "Closed"] },
+        "reasonCode": {
+          "type": "string",
+          "enum": ["GENERAL_INQUIRY", "PAYMENT_DISPUTE", "HARDSHIP_REQUEST", "DELINQUENCY_FOLLOWUP", "OTHER"]
+        },
+        "assignedTo": { "type": ["string", "null"], "x-pii": false },
+        "openedAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "Customer360": {
+      "type": "object",
+      "required": ["partyId", "displayName", "loanAccountSummaries", "recentInteractions", "openCases"],
+      "properties": {
+        "partyId": { "type": "string", "format": "uuid" },
+        "displayName": { "type": "string", "x-pii": true },
+        "loanAccountSummaries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["loanAccountId", "status"],
+            "properties": {
+              "loanAccountId": { "type": "string", "format": "uuid" },
+              "status": { "type": "string", "enum": ["Approved", "PendingDisbursement", "Disbursed", "Closed", "ChargedOff"] }
+            },
+            "additionalProperties": false,
+            "description": "Status only — deliberately no principal, balance, or term data. Customer360 is a CRM read model; it never surfaces Money."
+          }
+        },
+        "recentInteractions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Interaction" }
+        },
+        "openCases": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ServiceCase" }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,394 @@
+openapi: 3.1.0
+info:
+  title: General Ledger & Posting Engine API
+  version: 0.3.0
+  description: >
+    The ONLY component in the system permitted to write a JournalEntry. Every entry
+    is balanced (debits = credits), atomic, immutable, and idempotent, keyed on
+    `sourceEventId`. There is no update or delete path — corrections are always a
+    new, separate entry with a new idempotency key. Retrofitted to the API/Event
+    Spec Agent's conventions (v0.3.0, BREAKING from v0.2.0):
+    (1) Money fields are now the shared {amount: integer minor-units, currency}
+    object (../schemas/money.schema.json), never a bare float — every prior
+    `amount: number` / `currency: string` pair is replaced.
+    (2) The idempotency key moves from a `sourceEventId` body field to a required
+    `Idempotency-Key` header; GL persists the header value as the response's
+    `sourceEventId`. A reused key with a different payload now returns 409
+    (previously undocumented as a distinct case from 400).
+    (3) The JournalEntry response now includes `runningBalanceAfter` (Money) on
+    every line, so callers never need a separate read to confirm the posting
+    effect.
+    (4) JournalEntry is now a shared schema (../schemas/journal-entry.schema.json)
+    referenced via $ref, not declared inline — its own description states the
+    income-recognition principle every posting rule below follows: Income
+    accounts are credited exactly once, at accrual/assessment time; every
+    cash-collection entry clears Cash against the Receivable, never re-credits
+    Income. PR-DELINQ-02 is the one exception (a waiver reverses Income directly).
+    Also newly registers PR-PAYOFF-01 (CB-PAYOFF) and corrects a documentation
+    error from the pre-retrofit design note, which described PR-REPAY-01 and the
+    original PR-PAYOFF-01 draft as crediting FeeIncome/InterestIncome on
+    collection — that would have double-recognized income already booked at
+    accrual/assessment time. The actual OpenAPI schema never encoded that error
+    (account selection was always GL-internal), so this is a documentation
+    correction, not a breaking behavior change.
+  x-adapter: GLPostingAdapter
+  x-epics: [CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF]
+  x-req-ids:
+    - REQ-CB-DISB-003
+    - REQ-CB-DISB-007
+    - REQ-CB-ACCR-002
+    - REQ-CB-ACCR-003
+    - REQ-CB-ACCR-004
+    - REQ-CB-REPAY-002
+    - REQ-CB-REPAY-003
+    - REQ-CB-REPAY-004
+    - REQ-CB-REPAY-007
+    - REQ-CB-DELINQ-002
+    - REQ-CB-DELINQ-004
+    - REQ-CB-DELINQ-007
+    - REQ-CB-PAYOFF-004
+    - REQ-CB-PAYOFF-005
+
+servers:
+  - url: https://gl.internal.core-banking.example/v1
+    description: General Ledger & Posting Engine — internal service network only
+
+security:
+  - serviceAuth: []
+
+paths:
+  /journal-entries:
+    post:
+      operationId: postJournalEntry
+      summary: Post a balanced journal entry
+      description: >
+        Callers supply a `postingRuleCode` and the minimal context that rule needs
+        (amount or allocation, loanAccountId); GL derives the actual debit/credit
+        lines from the rule definition server-side — callers never construct
+        lines, GL accounts, or DEBIT/CREDIT directions directly, which is what
+        guarantees every entry is balanced by construction. Idempotent on the
+        `Idempotency-Key` header: a repeated call with the same key returns the
+        original entry (200) and posts nothing new, regardless of whether the
+        request payload differs (the first-seen payload always wins) — a reused
+        key with a materially different payload returns 409 instead.
+      tags: [JournalEntry]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PostJournalEntryRequest'
+            examples:
+              disbursement:
+                summary: "PR-DISB-01 — fund a disbursement (Idempotency-Key: disb:3f2a9e2e-6b1a-4c9d-8b3a-1e2f3a4b5c6d)"
+                value:
+                  postingRuleCode: PR-DISB-01
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  amount: { amount: 1500000, currency: USD }
+              disbursementReversal:
+                summary: "PR-DISB-02 — reverse a failed/returned disbursement (Idempotency-Key: disb:3f2a9e2e-6b1a-4c9d-8b3a-1e2f3a4b5c6d:reversal)"
+                value:
+                  postingRuleCode: PR-DISB-02
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  amount: { amount: 1500000, currency: USD }
+                  reversalOfSourceEventId: "disb:3f2a9e2e-6b1a-4c9d-8b3a-1e2f3a4b5c6d"
+              dailyAccrual:
+                summary: "PR-ACCR-01 — post one day's accrued interest (Idempotency-Key: accr:8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a:2026-08-16)"
+                value:
+                  postingRuleCode: PR-ACCR-01
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  amount: { amount: 616, currency: USD }
+                  metadata:
+                    businessDate: "2026-08-16"
+                    annualInterestRateBps: 1499
+                    dayCountConvention: ACTUAL_365
+                    principalBasis: { amount: 1500000, currency: USD }
+                    termVersion: 1
+              repayment:
+                summary: "PR-REPAY-01 — apply a repayment through the waterfall, clearing Receivables (Idempotency-Key: repay:ACH-2026081600123456)"
+                value:
+                  postingRuleCode: PR-REPAY-01
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  allocation:
+                    feeAmount: { amount: 2500, currency: USD }
+                    interestAmount: { amount: 18734, currency: USD }
+                    principalAmount: { amount: 28766, currency: USD }
+              repaymentReversal:
+                summary: "PR-REPAY-02 — reverse a returned (NSF) repayment (Idempotency-Key: repay:ACH-2026081600123456:reversal)"
+                value:
+                  postingRuleCode: PR-REPAY-02
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  allocation:
+                    feeAmount: { amount: 2500, currency: USD }
+                    interestAmount: { amount: 18734, currency: USD }
+                    principalAmount: { amount: 28766, currency: USD }
+                  reversalOfSourceEventId: "repay:ACH-2026081600123456"
+              lateFee:
+                summary: "PR-DELINQ-01 — assess a late fee, recognizing Fee Income (Idempotency-Key: late-fee:8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a:2026-07-15)"
+                value:
+                  postingRuleCode: PR-DELINQ-01
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  amount: { amount: 2500, currency: USD }
+              lateFeeWaiver:
+                summary: 'PR-DELINQ-02 — waive a fee, reversing Fee Income directly (the one exception to "collection entries never touch Income") (Idempotency-Key: late-fee:8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a:2026-07-15:waiver)'
+                value:
+                  postingRuleCode: PR-DELINQ-02
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  amount: { amount: 2500, currency: USD }
+                  reversalOfSourceEventId: "late-fee:8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a:2026-07-15"
+                  metadata:
+                    waivedBy: "ops.analyst.mramirez"
+                    reasonCode: GOODWILL
+              payoff:
+                summary: "PR-PAYOFF-01 — zero the loan, clearing LoanReceivable and InterestReceivable (never crediting Income — see PR-ACCR-01/PR-DELINQ-01 for where that income was already recognized) (Idempotency-Key: payoff:9c8d2e3f-4a5b-6c7d-8b3a-1e2f3a4b5c6d)"
+                value:
+                  postingRuleCode: PR-PAYOFF-01
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  allocation:
+                    feeAmount: { amount: 0, currency: USD }
+                    interestAmount: { amount: 18734, currency: USD }
+                    principalAmount: { amount: 1481266, currency: USD }
+      responses:
+        '201':
+          description: New entry posted
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/journal-entry.schema.json#/$defs/JournalEntry'
+        '200':
+          description: Idempotent replay — original entry returned, nothing new posted
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/journal-entry.schema.json#/$defs/JournalEntry'
+        '400':
+          description: >
+            Unknown postingRuleCode; required rule-specific context missing
+            (PR-ACCR-01 without required metadata fields; PR-DELINQ-02 without
+            metadata.waivedBy/reasonCode); wrong input shape for the rule
+            (PR-DISB-*/PR-ACCR-01/PR-DELINQ-* require `amount`, PR-REPAY-*/
+            PR-PAYOFF-01 require `allocation`); an allocation whose three
+            categories are all 0; or a Money field with a non-integer amount or
+            non-ISO-4217 currency.
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: loanAccountId does not resolve to an existing loan account
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '409':
+          description: Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '422':
+          description: postingRuleCode = PR-DISB-02, PR-REPAY-02, or PR-DELINQ-02 but reversalOfSourceEventId does not reference an existing posted entry
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /journal-entries/{journalEntryId}:
+    get:
+      operationId: getJournalEntry
+      summary: Retrieve a posted journal entry by ID
+      tags: [JournalEntry]
+      parameters:
+        - name: journalEntryId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The entry
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/journal-entry.schema.json#/$defs/JournalEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /journal-entries/search:
+    get:
+      operationId: findJournalEntryBySourceEvent
+      summary: Look up a journal entry by its sourceEventId (idempotency lookup)
+      description: sourceEventId here is the same value a caller previously sent as its Idempotency-Key.
+      tags: [JournalEntry]
+      parameters:
+        - name: sourceEventId
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Matching entry, if one has been posted
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/journal-entry.schema.json#/$defs/JournalEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No entry posted yet for this sourceEventId
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >
+        Client-supplied retry-safety token for this specific business event
+        (e.g. `disb:{disbursementId}`, `accr:{loanAccountId}:{date}`,
+        `repay:{paymentReferenceId}`, `late-fee:{loanAccountId}:{dueDate}`,
+        `payoff:{payoffId}`). GL persists this value verbatim as the resulting
+        JournalEntry's `sourceEventId`.
+      schema:
+        type: string
+
+  securitySchemes:
+    serviceAuth:
+      type: oauth2
+      description: OAuth2 client-credentials grant, internal service network + mTLS at the transport layer
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.internal.core-banking.example/oauth2/token
+          scopes:
+            gl:journal-entry:write: Post journal entries
+            gl:journal-entry:read: Read journal entries
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Unauthorized:
+      description: Missing or invalid access token
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Forbidden:
+      description: Token valid but missing the required scope
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    InternalServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+
+  schemas:
+    Allocation:
+      type: object
+      required: [feeAmount, interestAmount, principalAmount]
+      description: >
+        Categorized breakdown of a single posting across GL's fee/interest/
+        principal Receivable (or, for PR-REPAY-02 reversal, the mirrored debit)
+        accounts. All three keys are always present (use amount: 0 for a
+        category with nothing applied); GL omits the corresponding line
+        entirely for any category that is exactly 0, rather than posting a
+        zero-amount line. At least one category must be greater than 0 —
+        enforced server-side (400). All three Money fields must share the same
+        currency — also enforced server-side (400), not schema-expressible here.
+      properties:
+        feeAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        interestAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        principalAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+
+    PostJournalEntryRequest:
+      type: object
+      required: [postingRuleCode, loanAccountId]
+      description: >
+        Exactly one of `amount` or `allocation` must be present — never both,
+        never neither. `amount` serves single-credit-line rules (PR-DISB-*,
+        PR-ACCR-01, PR-DELINQ-*). `allocation` serves rules whose credit (or,
+        for a reversal, debit) side splits across multiple GL accounts by
+        business category — PR-REPAY-01/02 and PR-PAYOFF-01, whose split is the
+        outcome of AccountAPI's waterfall/payoff computation and cannot be
+        reduced to one number without losing the categorization GL needs to
+        pick the right accounts. This is a categorized business breakdown, not
+        raw ledger lines — callers still never specify a GL account code or
+        DEBIT/CREDIT direction directly.
+      oneOf:
+        - required: [amount]
+        - required: [allocation]
+      properties:
+        postingRuleCode:
+          $ref: '#/components/schemas/PostingRuleCode'
+        loanAccountId:
+          type: string
+          format: uuid
+        amount:
+          allOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
+          description: Required for PR-DISB-01, PR-DISB-02, PR-ACCR-01, PR-DELINQ-01, PR-DELINQ-02. Mutually exclusive with `allocation`.
+        allocation:
+          $ref: '#/components/schemas/Allocation'
+        reversalOfSourceEventId:
+          type: string
+          description: Required when postingRuleCode = PR-DISB-02, PR-REPAY-02, or PR-DELINQ-02; must reference an already-posted sourceEventId (the target entry's original Idempotency-Key value).
+        metadata:
+          type: object
+          additionalProperties: true
+          description: >
+            Rule-specific audit context, opaque to GL beyond storage — GL persists
+            it verbatim on the resulting JournalEntry but does not interpret it
+            when deriving debit/credit lines. Required when postingRuleCode =
+            PR-ACCR-01 (REQ-CB-ACCR-004): must carry businessDate,
+            annualInterestRateBps, dayCountConvention, principalBasis (Money),
+            and termVersion. ALSO required when postingRuleCode = PR-DELINQ-02
+            (REQ-CB-DELINQ-007): must carry waivedBy and reasonCode — the
+            mandatory authorization record for a fee waiver. Every other rule
+            omits metadata.
+
+    PostingRuleCode:
+      type: string
+      description: >
+        Extensible catalog of posting rules. See the Consolidated Posting-Rule
+        Catalog (Design Doc Appendix B) for the full list and each rule's GL
+        account mapping.
+      enum:
+        - PR-DISB-01
+        - PR-DISB-02
+        - PR-ACCR-01
+        - PR-REPAY-01
+        - PR-REPAY-02
+        - PR-DELINQ-01
+        - PR-DELINQ-02
+        - PR-PAYOFF-01

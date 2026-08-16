@@ -1,0 +1,204 @@
+asyncapi: 2.6.0
+info:
+  title: Batch/EOD & Reconciliation Events
+  version: 0.1.0
+  description: >
+    Domain events published by Batch/EOD & Reconciliation. Cumulative across
+    change sets: CB-ACCR's accrual-completeness exception, CB-REPAY's
+    repayment-completeness exception, and CB-DELINQ's fee-vs-DPD-change
+    completeness exception. Batch/EOD's role across all three epics is a
+    detective control, not a corrective one — these channels exist to surface a
+    mismatch, never to trigger an automatic fix; every event here is expected to
+    route to a human (Ops/Financial-Reporting) via the BEOD dashboard, not to any
+    of the other five modules programmatically. No consumer among Party/CIF, CRM,
+    GL, Loan Account Subledger, or Payment Execution subscribes to this file's
+    channels today — note this is distinct from CB-REPAY's real-time
+    PaymentUnmatched and CB-DELINQ's DelinquencyStatusChanged/
+    LoanAccountNonAccrualFlagged (all in loan-account-subledger-events.yaml,
+    published by LAS): those fire in real time as their respective processing
+    happens; every channel in this file is an EOD-close safety net, checking
+    that two independently-derived counts agree rather than assuming a single
+    real-time event alone proves completeness.
+  x-epics: [CB-ACCR, CB-REPAY, CB-DELINQ]
+  x-req-ids:
+    - REQ-CB-ACCR-007
+    - REQ-CB-REPAY-006
+    - REQ-CB-DELINQ-008
+
+defaultContentType: application/json
+
+servers:
+  production:
+    url: events.internal.core-banking.example:9092
+    protocol: kafka
+    description: Core Banking domain event backbone
+
+channels:
+  accrual.exception.raised.v1:
+    description: >
+      REQ-CB-ACCR-007. Published by Batch/EOD at accrual-batch close for a
+      business date when the eligible-account count (from
+      GET /loan-accounts:accrual-eligible) does not match the confirmed
+      posted-entry count (from gl.journal-entry.posted.v1 filtered to
+      postingRuleCode = PR-ACCR-01) for that same date. Also raised directly from
+      a non-empty `failedAccountIds` list in the AccrualBatchSummary returned by
+      POST /loan-accounts:accrue, once every partition for the date has reported
+      in.
+      x-consumers: [Ops/BEOD dashboard]
+    publish:
+      operationId: publishAccrualExceptionRaised
+      summary: Eligible-account count and posted-entry count disagree for a business date
+      message:
+        $ref: '#/components/messages/AccrualExceptionRaised'
+
+  repayment.exception.raised.v1:
+    description: >
+      REQ-CB-REPAY-006. Published by Batch/EOD at end-of-day for any payment
+      received that business date whose Repayment resource is not in a terminal
+      state (Posted, Unmatched, or Reversed) by the EOD cutoff — i.e. it neither
+      posted cleanly nor was flagged Unmatched in real time, which real-time
+      PaymentUnmatched alone would not catch (e.g. a payment stuck mid-processing
+      after a partial system failure).
+      x-consumers: [Ops/BEOD dashboard]
+    publish:
+      operationId: publishRepaymentExceptionRaised
+      summary: One or more payments received today never reached a terminal state
+      message:
+        $ref: '#/components/messages/RepaymentExceptionRaised'
+
+  delinquency.exception.raised.v1:
+    description: >
+      REQ-CB-DELINQ-008. Published by Batch/EOD at delinquency-batch close for a
+      business date when fee assessments and DPD-bucket changes disagree in
+      either direction: an account that newly crossed its grace period with no
+      corresponding posted PR-DELINQ-01 entry (accountsMissingFee), or a posted
+      PR-DELINQ-01 entry for an account not confirmed past due
+      (feesWithoutPastDueAccount — same "should be structurally impossible, but
+      prove it" posture as AccrualExceptionRaised.unexpectedAccountIds). Also
+      raised directly from a non-empty `failedAccountIds` list in the
+      DelinquencyBatchSummary, once every partition for the date has reported in.
+      x-consumers: [Ops/BEOD dashboard]
+    publish:
+      operationId: publishDelinquencyExceptionRaised
+      summary: Fee assessments and DPD-bucket changes disagree for a business date
+      message:
+        $ref: '#/components/messages/DelinquencyExceptionRaised'
+
+components:
+  messages:
+    AccrualExceptionRaised:
+      name: AccrualExceptionRaised
+      title: Accrual Exception Raised
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/AccrualExceptionRaisedPayload'
+
+    RepaymentExceptionRaised:
+      name: RepaymentExceptionRaised
+      title: Repayment Exception Raised
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/RepaymentExceptionRaisedPayload'
+
+    DelinquencyExceptionRaised:
+      name: DelinquencyExceptionRaised
+      title: Delinquency Exception Raised
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/DelinquencyExceptionRaisedPayload'
+
+  schemas:
+    AccrualExceptionRaisedPayload:
+      type: object
+      required:
+        - businessDate
+        - eligibleAccountCount
+        - postedEntryCount
+        - missingAccountIds
+        - raisedAt
+      properties:
+        businessDate:
+          type: string
+          format: date
+        eligibleAccountCount:
+          type: integer
+          description: From GET /loan-accounts:accrual-eligible for this businessDate
+        postedEntryCount:
+          type: integer
+          description: Distinct loanAccountIds with a confirmed PR-ACCR-01 entry for this businessDate
+        missingAccountIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Eligible accounts with no confirmed PR-ACCR-01 entry for this businessDate
+        unexpectedAccountIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: >
+            Accounts with a posted PR-ACCR-01 entry for this businessDate that did
+            NOT appear on the eligible list — should be structurally impossible
+            given GL only posts what LAS requests, but modeled here so the
+            completeness check can prove that invariant rather than assume it.
+        raisedAt:
+          type: string
+          format: date-time
+
+    DelinquencyExceptionRaisedPayload:
+      type: object
+      required:
+        - businessDate
+        - newlyPastDueCount
+        - feesAssessedCount
+        - accountsMissingFee
+        - raisedAt
+      properties:
+        businessDate:
+          type: string
+          format: date
+        newlyPastDueCount:
+          type: integer
+          description: From DelinquencyBatchSummary.newlyPastDueCount for this businessDate
+        feesAssessedCount:
+          type: integer
+          description: Distinct loanAccountIds with a confirmed PR-DELINQ-01 entry for this businessDate
+        accountsMissingFee:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Accounts newly past their grace period with no confirmed PR-DELINQ-01 entry for this businessDate
+        feesWithoutPastDueAccount:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: >
+            Accounts with a posted PR-DELINQ-01 entry for this businessDate that
+            are NOT confirmed past due — should be structurally impossible given
+            GL only posts what LAS requests, but modeled here so the completeness
+            check can prove that invariant rather than assume it.
+        raisedAt:
+          type: string
+          format: date-time
+
+    RepaymentExceptionRaisedPayload:
+      type: object
+      required:
+        - businessDate
+        - unresolvedRepaymentIds
+        - raisedAt
+      properties:
+        businessDate:
+          type: string
+          format: date
+        unresolvedRepaymentIds:
+          type: array
+          items:
+            type: string
+          description: repaymentId values (= paymentReferenceId) not in Posted, Unmatched, or Reversed status as of EOD cutoff
+        raisedAt:
+          type: string
+          format: date-time

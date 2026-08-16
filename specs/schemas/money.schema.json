@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://core-banking.internal.example/schemas/money.schema.json",
+  "title": "Money",
+  "$defs": {
+    "Money": {
+      "type": "object",
+      "required": ["amount", "currency"],
+      "properties": {
+        "amount": {
+          "type": "integer",
+          "description": "Minor units (e.g. cents for USD, no decimal). Never a bare float — avoids binary floating-point rounding error in monetary math. A JournalEntry line of $150.00 USD is amount: 15000, currency: \"USD\"."
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$",
+          "description": "ISO 4217 currency code."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
