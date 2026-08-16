@@ -32,10 +32,18 @@ info:
     receiveRepaymentNotification via an optional payoffQuoteId field rather
     than a separate endpoint, since a payoff payment IS an inbound payment,
     just one tagged with a quote reference.
+    (5) CB-CHARGEOFF (Loan Charge-off & Write-off) added in this increment:
+    charge-off itself is a new, separate action (POST /loan-accounts/{id}:chargeoff)
+    since it's not triggered by any inbound payment — but recovery IS just
+    another inbound payment, so receiveRepaymentNotification gains a third
+    branch, checked FIRST, ahead of the existing repayment/payoff branching: a
+    payment matched to a loan account already in "ChargedOff" status is always
+    a recovery, regardless of whether payoffQuoteId is present — a charged-off
+    account can never re-enter the ordinary repayment or payoff paths.
   contact:
     name: Loan Account Subledger team
   x-adapter: AccountAdapter
-  x-epics: [CB-BOOK, CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF]
+  x-epics: [CB-BOOK, CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF]
   x-req-ids:
     - REQ-CB-BOOK-001
     - REQ-CB-BOOK-002
@@ -81,6 +89,14 @@ info:
     - REQ-CB-PAYOFF-007
     - REQ-CB-PAYOFF-008
     - REQ-CB-PAYOFF-009
+    - REQ-CB-CHARGEOFF-001
+    - REQ-CB-CHARGEOFF-002
+    - REQ-CB-CHARGEOFF-003
+    - REQ-CB-CHARGEOFF-004
+    - REQ-CB-CHARGEOFF-005
+    - REQ-CB-CHARGEOFF-006
+    - REQ-CB-CHARGEOFF-007
+    - REQ-CB-CHARGEOFF-008
 
 servers:
   - url: https://las.internal.core-banking.example/v1
@@ -282,6 +298,145 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /loan-accounts/{loanAccountId}:chargeoff:
+    post:
+      operationId: recordChargeOff
+      summary: Record a charge-off decision against a loan account
+      description: >
+        REQ-CB-CHARGEOFF-001, 002, 003, 004. Ingests an already-approved
+        credit-policy decision — the decision itself (DPD threshold, approval
+        chain) is made upstream, out of scope for this endpoint, which only
+        records it and orchestrates the write-off. Creates the resource in
+        "PendingChargeOff" status, posts PR-CHGOFF-01 via GLPostingAPI (whose
+        `metadata.chargeoffDecisionReference`/`confirmedBy` retain the durable
+        link to the upstream approval artifact — REQ-CB-CHARGEOFF NFR), and
+        transitions to "ChargedOff" only once GL confirms
+        (REQ-CB-CHARGEOFF-003, the same confirmed-posting-gates-status-change
+        pattern as payoff closure). Idempotent on the Idempotency-Key header
+        (value = chargeoffDecisionReference): a retried call returns the
+        original outcome rather than writing off twice. Once ChargedOff, the
+        account is permanently excluded from daily accrual and delinquency fee
+        assessment (REQ-CB-CHARGEOFF-005) — the same status-based exclusion
+        mechanism runDailyAccrual/runDailyDelinquencyAssessment already apply
+        for Non-Accrual accounts.
+      tags: [ChargeOff]
+      parameters:
+        - $ref: '#/components/parameters/LoanAccountId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordChargeOffRequest'
+            examples:
+              standard:
+                summary: "Idempotency-Key = COLLECTIONS-DEC-2026-08-14-00931"
+                value:
+                  chargeoffDecisionReference: "COLLECTIONS-DEC-2026-08-14-00931"
+                  confirmedBy: "collections.system"
+      responses:
+        '201':
+          description: Charge-off recorded; write-off posting in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChargeOff'
+        '200':
+          description: Idempotent replay — original charge-off resource returned unchanged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChargeOff'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: >
+            Loan account is not in a charge-off-eligible status (e.g. already
+            ChargedOff or Closed), OR the Idempotency-Key was reused with a
+            materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /chargeoffs/{chargeoffId}:
+    get:
+      operationId: getChargeOff
+      summary: Retrieve the current state of a charge-off
+      description: >
+        REQ-CB-CHARGEOFF-001 through 004. Polling fallback for clients not
+        consuming loan.account.chargedoff. `chargeoffId` is always the
+        chargeoffDecisionReference used as the Idempotency-Key on
+        recordChargeOff — no separate ID space.
+      tags: [ChargeOff]
+      parameters:
+        - name: chargeoffId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current charge-off state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChargeOff'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /recoveries/{recoveryId}:
+    get:
+      operationId: getRecovery
+      summary: Retrieve the current state of a recovery payment
+      description: >
+        REQ-CB-CHARGEOFF-006. Polling fallback for clients not tracking
+        gl.entry.posted directly. `recoveryId` is always the paymentReferenceId
+        from the receiveRepaymentNotification call that produced it — no
+        separate ID space. There is no reversal endpoint for a Recovery in
+        this increment — a returned/NSF recovery payment is not a specified
+        flow (same class of open question as payoff-payment reversal).
+      tags: [ChargeOff]
+      parameters:
+        - name: recoveryId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current recovery state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Recovery'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /loan-accounts:accrual-eligible:
     get:
       operationId: listAccrualEligibleAccounts
@@ -465,8 +620,11 @@ paths:
       operationId: runDailyDelinquencyAssessment
       summary: Execute the daily delinquency assessment batch for a business date
       description: >
-        REQ-CB-DELINQ-001 through 005, 008. For every account with a payment
-        schedule: updates the DPD count/bucket for `asOf` (REQ-CB-DELINQ-003);
+        REQ-CB-DELINQ-001 through 005, 008; REQ-CB-CHARGEOFF-005. For every
+        account with a payment schedule EXCLUDING accounts already in
+        "ChargedOff" status (REQ-CB-CHARGEOFF-005 — a written-off asset is
+        never re-assessed for a late fee it will never realistically collect):
+        updates the DPD count/bucket for `asOf` (REQ-CB-DELINQ-003);
         for accounts newly past their contractual grace period, posts
         PR-DELINQ-01 via GLPostingAPI using an Idempotency-Key of the form
         `late-fee:{loanAccountId}:{scheduledDueDate}` (REQ-CB-DELINQ-002, 004);
@@ -594,25 +752,32 @@ paths:
   /repayments:notify:
     post:
       operationId: receiveRepaymentNotification
-      summary: Receive notification of an inbound payment (repayment or payoff) and process it
+      summary: Receive notification of an inbound payment (repayment, payoff, or recovery) and process it
       description: >
-        REQ-CB-REPAY-001 through 005; REQ-CB-PAYOFF-003 through 008. Called
-        synchronously by PaymentAPI immediately upon receipt of an inbound
-        payment. Idempotent on the Idempotency-Key header (value =
-        paymentReferenceId): a retried call returns the original outcome and
-        never re-applies the payment. Branches on `payoffQuoteId`:
-        (a) absent → standard repayment path — matches `loanAccountRef` to
-        exactly one active loan account (REQ-CB-REPAY-001; ambiguous/no match
-        publishes payment.match.failed and returns a Repayment with status
-        Unmatched, still 201/200, not an error — the payment was received
-        successfully, it just couldn't be matched), then applies the
-        fees→interest→principal waterfall and posts PR-REPAY-01
+        REQ-CB-REPAY-001 through 005; REQ-CB-PAYOFF-003 through 008;
+        REQ-CB-CHARGEOFF-006. Called synchronously by PaymentAPI immediately
+        upon receipt of an inbound payment. Idempotent on the Idempotency-Key
+        header (value = paymentReferenceId): a retried call returns the
+        original outcome and never re-applies the payment. First matches
+        `loanAccountRef` to exactly one active loan account (REQ-CB-REPAY-001;
+        ambiguous/no match publishes payment.match.failed and returns a
+        Repayment with status Unmatched, still 201/200, not an error — the
+        payment was received successfully, it just couldn't be matched). Once
+        matched, branches:
+        (0) matched loan account is in "ChargedOff" status → ALWAYS a recovery
+        (REQ-CB-CHARGEOFF-006), checked before any of the branches below —
+        `payoffQuoteId` is ignored if present, since a charged-off account can
+        never re-enter the ordinary repayment or payoff paths. Posts
+        PR-CHGOFF-02 for the full received amount and returns a Recovery
+        resource; the account remains ChargedOff.
+        (a) not charged off, `payoffQuoteId` absent → standard repayment path
+        — applies the fees→interest→principal waterfall and posts PR-REPAY-01
         (REQ-CB-REPAY-002, 003).
-        (b) present and references a valid, unexpired PayoffQuote, with amount
-        exactly equal to the quote total → posts PR-PAYOFF-01 for that exact
-        amount, closes the loan account once GLPostingAPI confirms
-        (REQ-CB-PAYOFF-004, 005, 006), and returns a Payoff resource instead of
-        a Repayment.
+        (b) not charged off, `payoffQuoteId` present and references a valid,
+        unexpired PayoffQuote, with amount exactly equal to the quote total →
+        posts PR-PAYOFF-01 for that exact amount, closes the loan account once
+        GLPostingAPI confirms (REQ-CB-PAYOFF-004, 005, 006), and returns a
+        Payoff resource instead of a Repayment.
         (c) present but amount is LESS than the quote total → degrades to the
         standard repayment path (REQ-CB-PAYOFF-007); the account is not closed
         and a new quote is required.
@@ -628,7 +793,7 @@ paths:
         reject to once funds have arrived — flagged as an open question in the
         Design Doc, resolved here as the least-surprising default rather than
         silently dropping the payment).
-      tags: [Repayment, Payoff]
+      tags: [Repayment, Payoff, ChargeOff]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -653,15 +818,23 @@ paths:
                   amount: { amount: 1500000, currency: USD }
                   rail: WIRE
                   receivedAt: "2026-08-16T09:12:00Z"
+              recovery:
+                summary: "Idempotency-Key = ACH-2026090200master77 (loanAccountRef matches an already-ChargedOff account)"
+                value:
+                  loanAccountRef: "LN-000398214"
+                  amount: { amount: 15000, currency: USD }
+                  rail: ACH
+                  receivedAt: "2026-09-02T14:03:00Z"
       responses:
         '201':
-          description: Payment processed (Repayment or Payoff created, per the branching above)
+          description: Payment processed (Repayment, Payoff, or Recovery created, per the branching above)
           content:
             application/json:
               schema:
                 oneOf:
                   - $ref: '#/components/schemas/Repayment'
                   - $ref: '#/components/schemas/Payoff'
+                  - $ref: '#/components/schemas/Recovery'
         '200':
           description: Idempotent replay — original outcome returned, nothing re-applied
           content:
@@ -670,6 +843,7 @@ paths:
                 oneOf:
                   - $ref: '#/components/schemas/Repayment'
                   - $ref: '#/components/schemas/Payoff'
+                  - $ref: '#/components/schemas/Recovery'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -976,6 +1150,8 @@ components:
             loan-subledger:delinquency:write: Trigger the daily delinquency batch and waive fees
             loan-subledger:delinquency:read: Read past-due status and fee state
             loan-subledger:payoff:read: Generate payoff quotes and read payoff status
+            loan-subledger:chargeoff:write: Record charge-off decisions
+            loan-subledger:chargeoff:read: Read charge-off and recovery status
 
   responses:
     BadRequest:
@@ -1005,6 +1181,74 @@ components:
           schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
 
   schemas:
+    RecordChargeOffRequest:
+      type: object
+      required: [chargeoffDecisionReference, confirmedBy]
+      properties:
+        chargeoffDecisionReference:
+          type: string
+          description: Must equal the Idempotency-Key header value. The durable link to the upstream credit-policy approval artifact (REQ-CB-CHARGEOFF NFR) — retained verbatim on the PR-CHGOFF-01 entry's metadata, not just here.
+        confirmedBy:
+          type: string
+          description: Identity of the confirming system/user
+
+    ChargeOff:
+      type: object
+      required: [chargeoffId, loanAccountId, status, writeOffAmount, chargeoffDecisionReference, confirmedBy, updatedAt]
+      properties:
+        chargeoffId:
+          type: string
+          description: Equal to the Idempotency-Key header value used on recordChargeOff
+        loanAccountId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [PendingChargeOff, ChargedOff]
+        writeOffAmount:
+          allOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
+          description: Total written off (principal + interest + any outstanding fees)
+        journalEntryId:
+          type: ["string", "null"]
+          format: uuid
+          description: Set once PR-CHGOFF-01 is confirmed posted
+        chargeoffDecisionReference:
+          type: string
+        confirmedBy:
+          type: string
+        chargedOffAt:
+          type: ["string", "null"]
+          format: date-time
+          description: Set only once GLPostingAPI confirms the write-off entry (REQ-CB-CHARGEOFF-003)
+        updatedAt:
+          type: string
+          format: date-time
+
+    Recovery:
+      type: object
+      required: [recoveryId, loanAccountId, amount, receivedAt, updatedAt]
+      properties:
+        recoveryId:
+          type: string
+          description: Equal to the Idempotency-Key header value used on receiveRepaymentNotification (REQ-CB-CHARGEOFF-006)
+        loanAccountId:
+          type: string
+          format: uuid
+          description: Always a ChargedOff account — recovery never applies to any other status
+        amount:
+          $ref: '../schemas/money.schema.json#/$defs/Money'
+        journalEntryId:
+          type: ["string", "null"]
+          format: uuid
+          description: Set once PR-CHGOFF-02 is confirmed posted. Deliberately NOT a reference to the original PR-CHGOFF-01 entry — recovery is a distinct entry type, not a reversal.
+        receivedAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
     LoanAccountBookingRequest:
       type: object
       required: [approvalReferenceId, partyId, bookedBy, terms]
@@ -1330,7 +1574,12 @@ components:
         payoffQuoteId:
           type: ["string", "null"]
           format: uuid
-          description: If present, this payment is a payoff attempt against the referenced PayoffQuote (see receiveRepaymentNotification's branching description).
+          description: >
+            If present, this payment is a payoff attempt against the
+            referenced PayoffQuote — ignored if the matched loan account is
+            already ChargedOff, since that case is always a recovery
+            regardless of this field (see receiveRepaymentNotification's
+            branching description).
         amount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
         rail:
           type: string

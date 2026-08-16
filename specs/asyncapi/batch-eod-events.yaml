@@ -7,23 +7,35 @@ info:
     Spec Agent's conventions (v0.3.0, BREAKING from v0.2.0): every topic
     renamed to the "<context>.<entity>.<eventPastTense>" convention with no
     version suffix. Also adds CB-PAYOFF's zero-balance completeness exception
-    (REQ-CB-PAYOFF-009) in this increment. BatchEodAdapter's role across all
-    four epics is a detective control, not a corrective one — these channels
-    exist to surface a mismatch, never to trigger an automatic fix; every
-    event here is expected to route to a human (Ops/Financial-Reporting), not
-    to any of the other five modules programmatically. This is distinct from
-    the real-time events in loan-account-subledger-events.yaml
-    (payment.match.failed, delinquency.status.changed, loan.nonaccrual.flagged):
+    (REQ-CB-PAYOFF-009), and — this increment — CB-CHARGEOFF's reserve
+    reconciliation exception (REQ-CB-CHARGEOFF-008). BatchEodAdapter's role
+    across all five epics is a detective control, not a corrective one — these
+    channels exist to surface a mismatch, never to trigger an automatic fix;
+    every event here is expected to route to a human (Ops/Financial-Reporting),
+    not to any of the other five modules programmatically.
+    `chargeoff.exception.raised` is structurally different from the other four
+    channels here: they all compare two independently-derived COUNTS of
+    per-account events for a single business date; this one compares two
+    independently-derived AMOUNTS — GLPostingAdapter's aggregate, portfolio-wide
+    AllowanceForLoanLosses control-account balance (via
+    GET /gl-accounts/{code}/balance) against the running sum of every
+    PR-CHGOFF-01 posting ever made (via gl.entry.posted) — since the reserve
+    account is not scoped to a single business date the way accrual/repayment/
+    delinquency/payoff completeness checks are.
+    This is distinct from the real-time events in
+    loan-account-subledger-events.yaml (payment.match.failed,
+    delinquency.status.changed, loan.nonaccrual.flagged, loan.account.chargedoff):
     those fire as their respective processing happens; every channel in this
-    file is an EOD-close safety net, checking that two independently-derived
-    counts agree rather than assuming a single real-time event alone proves
+    file is a safety net, checking that two independently-derived figures
+    agree rather than assuming a single real-time event alone proves
     completeness.
-  x-epics: [CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF]
+  x-epics: [CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF]
   x-req-ids:
     - REQ-CB-ACCR-007
     - REQ-CB-REPAY-006
     - REQ-CB-DELINQ-008
     - REQ-CB-PAYOFF-009
+    - REQ-CB-CHARGEOFF-008
 
 defaultContentType: application/json
 
@@ -87,6 +99,21 @@ channels:
       message:
         $ref: '#/components/messages/PayoffExceptionRaised'
 
+  chargeoff.exception.raised:
+    description: >
+      REQ-CB-CHARGEOFF-008. Published by BatchEodAdapter whenever
+      GLPostingAdapter's aggregate AllowanceForLoanLosses control-account
+      balance does not match the running sum of all confirmed PR-CHGOFF-01
+      postings — portfolio-wide, not scoped to a single business date (see
+      this file's info.description for why this channel's aggregation
+      pattern differs from the other three).
+      x-consumers: []
+    publish:
+      operationId: publishChargeoffExceptionRaised
+      summary: The AllowanceForLoanLosses balance and the sum of write-off postings disagree
+      message:
+        $ref: '#/components/messages/ChargeoffExceptionRaised'
+
 components:
   messages:
     AccrualExceptionRaised:
@@ -116,6 +143,13 @@ components:
       contentType: application/json
       payload:
         $ref: '#/components/schemas/PayoffExceptionRaisedPayload'
+
+    ChargeoffExceptionRaised:
+      name: ChargeoffExceptionRaised
+      title: Chargeoff Exception Raised
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ChargeoffExceptionRaisedPayload'
 
   schemas:
     AccrualExceptionRaisedPayload:
@@ -177,3 +211,24 @@ components:
               payoffId: { type: string }
               residualAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
         raisedAt: { type: string, format: date-time }
+
+    ChargeoffExceptionRaisedPayload:
+      type: object
+      required: [asOf, allowanceAccountBalance, sumOfChargeoffPostings, variance, raisedAt]
+      properties:
+        asOf:
+          type: string
+          format: date-time
+        allowanceAccountBalance:
+          allOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
+          description: From GET /gl-accounts/AllowanceForLoanLosses/balance
+        sumOfChargeoffPostings:
+          allOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
+          description: Running total of every confirmed PR-CHGOFF-01 posting, from gl.entry.posted
+        variance:
+          $ref: '../schemas/money.schema.json#/$defs/Money'
+        raisedAt:
+          type: string
+          format: date-time

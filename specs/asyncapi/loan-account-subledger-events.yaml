@@ -10,7 +10,8 @@ info:
     `payment.unmatched.v1` → `payment.match.failed`, a better 3-segment fit;
     `loan.account.nonaccrual.v1` → `loan.nonaccrual.flagged`); every Money
     field now the shared {amount, currency} object. Also adds CB-PAYOFF's
-    `loan.account.closed` event in this increment.
+    `loan.account.closed` event, and — this increment — CB-CHARGEOFF's
+    `loan.account.chargedoff` event.
     Note the deliberate asymmetry between CB-DISB and CB-BOOK's rejection
     handling: CB-DISB's disbursement rejection (REQ-CB-DISB-002) is NOT
     modeled as an event — surfaced only synchronously as a 422, since the
@@ -19,8 +20,13 @@ info:
     because REQ-CB-BOOK-001 explicitly requires rejected bookings to be
     "rejected to an exception queue". `payment.match.failed` follows the same
     pattern, because REQ-CB-REPAY-001 uses the same explicit "exception queue"
-    language.
-  x-epics: [CB-BOOK, CB-DISB, CB-REPAY, CB-DELINQ, CB-PAYOFF]
+    language. `loan.account.chargedoff` follows the same non-exception pattern
+    as `loan.account.closed` — a correctly-functioning terminal-state
+    transition, not a failure mode. Recovery payments deliberately do NOT get
+    their own event here — REQ-CB-CHARGEOFF-007 requires CRM logging only for
+    the charge-off event itself, not each recovery; a recovery's only
+    published trace is the generic gl.entry.posted (filtered to PR-CHGOFF-02).
+  x-epics: [CB-BOOK, CB-DISB, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF]
   x-req-ids:
     - REQ-CB-BOOK-001
     - REQ-CB-BOOK-002
@@ -34,6 +40,8 @@ info:
     - REQ-CB-DELINQ-006
     - REQ-CB-PAYOFF-008
     - REQ-CB-PAYOFF-009
+    - REQ-CB-CHARGEOFF-005
+    - REQ-CB-CHARGEOFF-007
 
 defaultContentType: application/json
 
@@ -153,6 +161,24 @@ channels:
       message:
         $ref: '#/components/messages/LoanAccountClosed'
 
+  loan.account.chargedoff:
+    description: >
+      REQ-CB-CHARGEOFF-003, 005, 007. Published once a loan account
+      transitions to "ChargedOff" status — which happens only after
+      GLPostingAPI confirms the PR-CHGOFF-01 write-off entry. Consumed by
+      CRMAdapter (REQ-CB-CHARGEOFF-007, interaction log only — no balance/
+      reserve detail) and BatchEodAdapter (REQ-CB-CHARGEOFF-008, reserve
+      reconciliation feed). The daily accrual and delinquency batches do NOT
+      subscribe to this event to drive their exclusion logic
+      (REQ-CB-CHARGEOFF-005) — same pattern as loan.nonaccrual.flagged, they
+      read current LoanAccount status directly, same-service, at batch time.
+      x-consumers: [CRMAdapter, BatchEodAdapter]
+    publish:
+      operationId: publishLoanAccountChargedOff
+      summary: A loan account has been charged off
+      message:
+        $ref: '#/components/messages/LoanAccountChargedOff'
+
 components:
   messages:
     LoanAccountBooked:
@@ -210,6 +236,13 @@ components:
       contentType: application/json
       payload:
         $ref: '#/components/schemas/LoanAccountClosedPayload'
+
+    LoanAccountChargedOff:
+      name: LoanAccountChargedOff
+      title: Loan Account Charged Off
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/LoanAccountChargedOffPayload'
 
   schemas:
     LoanAccountBookedPayload:
@@ -323,5 +356,21 @@ components:
         closedAt: { type: string, format: date-time }
       description: >
         Deliberately contains no balance, quote breakdown, or GL account
+        detail — CRMAdapter's subscription must never require reading a
+        balance.
+
+    LoanAccountChargedOffPayload:
+      type: object
+      required: [loanAccountId, chargeoffId, journalEntryId, chargedOffAt]
+      properties:
+        loanAccountId: { type: string, format: uuid }
+        chargeoffId: { type: string }
+        journalEntryId:
+          type: string
+          format: uuid
+          description: Reference only — GLPostingAPI remains the sole source of truth for the entry itself
+        chargedOffAt: { type: string, format: date-time }
+      description: >
+        Deliberately contains no write-off amount, reserve, or GL account
         detail — CRMAdapter's subscription must never require reading a
         balance.

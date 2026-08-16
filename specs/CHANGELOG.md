@@ -1,5 +1,64 @@
 # Spec Changelog
 
+## CB-CHARGEOFF — 2026-08-16
+
+Adds Loan Charge-off & Write-off on top of the v0.3.0 retrofit conventions
+(no version bump needed on the files below beyond their already-current
+0.3.0 — this is additive within the retrofitted shape, not a further
+breaking change).
+
+**`openapi/gl-posting-engine.yaml`**
+- Registers `PR-CHGOFF-01` (write-off) and `PR-CHGOFF-02` (recovery).
+  `PR-CHGOFF-01` is the first posting rule whose debit side is not
+  Cash/Nostro — it debits `AllowanceForLoanLosses`, credited by the same
+  `allocation` shape `PR-REPAY-01`/`PR-PAYOFF-01` already use. Requires
+  `metadata.chargeoffDecisionReference`/`confirmedBy` (mandatory, same
+  pattern as `PR-DELINQ-02`'s waiver authorization) so the durable link to
+  the upstream credit-policy approval artifact travels with the ledger
+  entry. `PR-CHGOFF-02` is deliberately **not** a reversal of `PR-CHGOFF-01`
+  — collecting a recovery on a written-off asset doesn't undo the write-off
+  decision, so it carries no `reversalOfSourceEventId`.
+- New endpoint `GET /gl-accounts/{glAccountCode}/balance` — a portfolio-wide
+  GL control-account balance read, distinct from `runningBalanceAfter`
+  (which is per-loan-account, per-line). Needed because
+  REQ-CB-CHARGEOFF-008's reserve reconciliation compares the aggregate
+  `AllowanceForLoanLosses` balance against the summed total of every
+  `PR-CHGOFF-01` posting, not a per-account figure.
+
+**`openapi/loan-account-subledger.yaml`**
+- New `POST /loan-accounts/{id}:chargeoff`, `GET /chargeoffs/{id}`,
+  `GET /recoveries/{id}`.
+- `receiveRepaymentNotification` gains a new branch, checked **first**, ahead
+  of the existing repayment/payoff logic: a payment matched to an account
+  already in `ChargedOff` status is always a recovery — `payoffQuoteId` is
+  ignored if present, since a charged-off account can never re-enter the
+  ordinary repayment or payoff paths. No separate endpoint for recovery,
+  since it's just another inbound payment.
+- `runDailyDelinquencyAssessment` now explicitly excludes `ChargedOff`
+  accounts (REQ-CB-CHARGEOFF-005); `runDailyAccrual`'s existing
+  eligibility rule (`status = Disbursed`) already excluded them implicitly,
+  and `AccrualExclusion.reasonCode` already anticipated `CHARGED_OFF` from
+  the prior increment.
+
+**`asyncapi/loan-account-subledger-events.yaml`**
+- New `loan.account.chargedoff` (LAS → CRMAdapter, BatchEodAdapter). No
+  separate event for recovery — REQ-CB-CHARGEOFF-007 requires CRM logging
+  only for the charge-off event itself; a recovery's only trace is the
+  generic `gl.entry.posted` filtered to `PR-CHGOFF-02`.
+
+**`asyncapi/batch-eod-events.yaml`**
+- New `chargeoff.exception.raised`. Structurally different from the other
+  four exception channels in this file: they compare per-business-date
+  *counts*; this one compares two independently-derived *amounts*
+  (portfolio-wide, not date-scoped) — documented explicitly in the file's
+  `info.description` so the difference reads as deliberate, not an
+  inconsistency.
+
+**`asyncapi/gl-posting-engine-events.yaml`**
+- Documentation-only update (header, channel description) — no payload
+  change needed, since the shared `JournalEntry` schema already generalizes
+  over any rule's debit account.
+
 ## v0.3.0 retrofit — 2026-08-16
 
 Retrofit of every existing internal-module spec to the API/Event Spec

@@ -31,8 +31,25 @@ info:
     accrual/assessment time. The actual OpenAPI schema never encoded that error
     (account selection was always GL-internal), so this is a documentation
     correction, not a breaking behavior change.
+    This increment registers CB-CHARGEOFF's two rules: PR-CHGOFF-01 (write-off)
+    is the first rule whose debit side is NOT Cash/Nostro — it debits a single
+    control account, AllowanceForLoanLosses, credited by an `allocation` split
+    the same shape PR-REPAY-01/PR-PAYOFF-01 already use, just against a
+    different debit account (documented per-rule, since PostJournalEntryRequest
+    intentionally never lets a caller specify GL accounts, so the debit-side
+    difference is invisible at the request/response schema level — only the
+    rule catalog documents it). PR-CHGOFF-02 (recovery) is deliberately NOT a
+    reversal of PR-CHGOFF-01 — it is its own distinct entry (Dr Cash/Nostro /
+    Cr RecoveryIncome), since a recovery collects money on an asset already
+    written off, it doesn't undo the write-off decision. Also adds
+    GET /gl-accounts/{glAccountCode}/balance, a new capability distinct from
+    `runningBalanceAfter`: that field is a per-loan-account balance on each
+    JournalEntry line, whereas this endpoint reads a portfolio-wide GL control
+    account's current balance — needed because REQ-CB-CHARGEOFF-008's reserve
+    reconciliation compares AllowanceForLoanLosses' aggregate balance against
+    the sum of all PR-CHGOFF-01 postings, not a per-account figure.
   x-adapter: GLPostingAdapter
-  x-epics: [CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF]
+  x-epics: [CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF]
   x-req-ids:
     - REQ-CB-DISB-003
     - REQ-CB-DISB-007
@@ -48,6 +65,10 @@ info:
     - REQ-CB-DELINQ-007
     - REQ-CB-PAYOFF-004
     - REQ-CB-PAYOFF-005
+    - REQ-CB-CHARGEOFF-002
+    - REQ-CB-CHARGEOFF-004
+    - REQ-CB-CHARGEOFF-006
+    - REQ-CB-CHARGEOFF-008
 
 servers:
   - url: https://gl.internal.core-banking.example/v1
@@ -150,6 +171,24 @@ paths:
                     feeAmount: { amount: 0, currency: USD }
                     interestAmount: { amount: 18734, currency: USD }
                     principalAmount: { amount: 1481266, currency: USD }
+              chargeoff:
+                summary: "PR-CHGOFF-01 — write off a loan; debits AllowanceForLoanLosses, credits Receivables (Idempotency-Key: chgoff:8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a)"
+                value:
+                  postingRuleCode: PR-CHGOFF-01
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  allocation:
+                    feeAmount: { amount: 0, currency: USD }
+                    interestAmount: { amount: 21450, currency: USD }
+                    principalAmount: { amount: 942100, currency: USD }
+                  metadata:
+                    chargeoffDecisionReference: "COLLECTIONS-DEC-2026-08-14-00931"
+                    confirmedBy: "collections.system"
+              recovery:
+                summary: "PR-CHGOFF-02 — recover cash on a charged-off loan; NOT a reversal of PR-CHGOFF-01 (Idempotency-Key: ACH-2026090200master77)"
+                value:
+                  postingRuleCode: PR-CHGOFF-02
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  amount: { amount: 15000, currency: USD }
       responses:
         '201':
           description: New entry posted
@@ -167,11 +206,12 @@ paths:
           description: >
             Unknown postingRuleCode; required rule-specific context missing
             (PR-ACCR-01 without required metadata fields; PR-DELINQ-02 without
-            metadata.waivedBy/reasonCode); wrong input shape for the rule
-            (PR-DISB-*/PR-ACCR-01/PR-DELINQ-* require `amount`, PR-REPAY-*/
-            PR-PAYOFF-01 require `allocation`); an allocation whose three
-            categories are all 0; or a Money field with a non-integer amount or
-            non-ISO-4217 currency.
+            metadata.waivedBy/reasonCode; PR-CHGOFF-01 without
+            metadata.chargeoffDecisionReference/confirmedBy); wrong input shape
+            for the rule (PR-DISB-*/PR-ACCR-01/PR-DELINQ-*/PR-CHGOFF-02 require
+            `amount`, PR-REPAY-*/PR-PAYOFF-01/PR-CHGOFF-01 require
+            `allocation`); an allocation whose three categories are all 0; or a
+            Money field with a non-integer amount or non-ISO-4217 currency.
           content:
             application/json:
               schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
@@ -260,6 +300,56 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /gl-accounts/{glAccountCode}/balance:
+    get:
+      operationId: getGlAccountBalance
+      summary: Retrieve a portfolio-wide GL control account's current balance
+      description: >
+        REQ-CB-CHARGEOFF-008. Distinct from the per-loan-account
+        `runningBalanceAfter` on each JournalEntry line — this reads the
+        aggregate balance of a single named control account (e.g.
+        AllowanceForLoanLosses) across the entire portfolio, as of a given
+        instant. Batch/EOD calls this to compare against the independently
+        summed total of PR-CHGOFF-01 postings (via gl.entry.posted) for the
+        reserve reconciliation; a mismatch drives chargeoff.exception.raised
+        (see batch-eod-events.yaml).
+      tags: [GlAccount]
+      parameters:
+        - name: glAccountCode
+          in: path
+          required: true
+          schema:
+            type: string
+          examples:
+            allowance:
+              value: AllowanceForLoanLosses
+        - name: asOf
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Defaults to now if omitted.
+      responses:
+        '200':
+          description: Current (or as-of) balance for the named control account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GlAccountBalance'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Unknown glAccountCode
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   parameters:
     IdempotencyKey:
@@ -285,6 +375,7 @@ components:
           scopes:
             gl:journal-entry:write: Post journal entries
             gl:journal-entry:read: Read journal entries
+            gl:account-balance:read: Read GL control account balances
 
   responses:
     BadRequest:
@@ -314,6 +405,18 @@ components:
           schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
 
   schemas:
+    GlAccountBalance:
+      type: object
+      required: [glAccountCode, balance, asOf]
+      properties:
+        glAccountCode:
+          type: string
+        balance:
+          $ref: '../schemas/money.schema.json#/$defs/Money'
+        asOf:
+          type: string
+          format: date-time
+
     Allocation:
       type: object
       required: [feeAmount, interestAmount, principalAmount]
@@ -374,8 +477,13 @@ components:
             annualInterestRateBps, dayCountConvention, principalBasis (Money),
             and termVersion. ALSO required when postingRuleCode = PR-DELINQ-02
             (REQ-CB-DELINQ-007): must carry waivedBy and reasonCode — the
-            mandatory authorization record for a fee waiver. Every other rule
-            omits metadata.
+            mandatory authorization record for a fee waiver. ALSO required when
+            postingRuleCode = PR-CHGOFF-01: must carry chargeoffDecisionReference
+            and confirmedBy — the durable link to the upstream credit-policy
+            approval artifact a write-off must retain, per the same
+            "authorization travels with the ledger entry, not just the
+            caller's own record" principle as the fee-waiver case. Every other
+            rule omits metadata.
 
     PostingRuleCode:
       type: string
@@ -392,3 +500,5 @@ components:
         - PR-DELINQ-01
         - PR-DELINQ-02
         - PR-PAYOFF-01
+        - PR-CHGOFF-01
+        - PR-CHGOFF-02
