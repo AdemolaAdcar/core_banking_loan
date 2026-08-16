@@ -61,16 +61,17 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
   <div class="meta">
     Prepared by: Ledger &amp; Solution Architect Agent<br>
     Date: August 16, 2026<br>
-    Version: 1.0 (Draft)<br>
-    Inputs: 8 approved epics / 61 REQ-IDs from the Loan Ledger BRD
+    Version: 2.0 (Regenerated — reflects the implemented OpenAPI/AsyncAPI contracts)<br>
+    Inputs: 8 approved epics / 61 REQ-IDs from the Loan Ledger BRD, plus specs/CHANGELOG.md
   </div>
   <div class="disclaimer">
-    <strong>Status: Design Scaffold, Not Implementation-Ready.</strong><br>
-    This document translates the approved BRD requirements into module ownership, interaction
-    sequences, spec/event/flag inventories, and NFR notes. No external "Sections 4-8" architecture
-    document was supplied — the constraints below (from the Architect Agent's system prompt) serve
-    as the governing reference. Full OpenAPI 3.1 / AsyncAPI 2.6 contracts still need to be authored
-    per the spec-file list in each section before implementation begins.
+    <strong>Status: Implemented and Validated.</strong><br>
+    Full OpenAPI 3.1 / AsyncAPI 2.6 contracts for all 8 epics now exist under <code>specs/</code>,
+    validated with openapi-spec-validator and cross-checked against real payloads with jsonschema.
+    This document has been regenerated from Version 1.0's pre-implementation design scaffold to
+    match what was actually built — every gap or naming change found during implementation is
+    called out explicitly per epic below, not silently smoothed over.
+    <code>specs/CHANGELOG.md</code> remains the authoritative, file-by-file record.
   </div>
 </div>
 
@@ -78,21 +79,26 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
 <h2 style="page-break-before:none;">Architecture Context &amp; Conventions</h2>
 
 <h3>Modules</h3>
-<ul class="module-list"><li><strong>PTY</strong> — Party/CIF</li><li><strong>CRM</strong> — CRM</li><li><strong>GL</strong> — General Ledger &amp; Posting Engine</li><li><strong>LAS</strong> — Loan Account Subledger</li><li><strong>PAY</strong> — Payment Execution</li><li><strong>BEOD</strong> — Batch/EOD &amp; Reconciliation</li></ul>
+<ul class="module-list"><li><strong>PTY</strong> — Party/CIF (PartyAPI / PartyAdapter)</li><li><strong>CRM</strong> — CRM (CRMAPI / CRMAdapter — no prior adapter existed in the Core Banking Adapter Layer; drafted fresh: logInteraction, openCase, getCustomer360, zero Money fields anywhere)</li><li><strong>GL</strong> — General Ledger &amp; Posting Engine (GLPostingAPI / GLPostingAdapter)</li><li><strong>LAS</strong> — Loan Account Subledger (AccountAPI / AccountAdapter)</li><li><strong>PAY</strong> — Payment Execution (PaymentAPI / PaymentAdapter)</li><li><strong>BEOD</strong> — Batch/EOD &amp; Reconciliation (BatchEodAdapter)</li></ul>
 
 <h3>Non-Negotiable Constraints</h3>
-<ul class="constraint-list"><li>Each module owns its own data store; cross-module reads use published domain events or a synchronous OpenAPI call to the owning module — never direct database access.</li><li>CRM has no path into the Posting Engine at all. If a design routes a CRM capability through GL, that is a design error, not a shortcut.</li><li>The General Ledger &amp; Posting Engine is the ONLY component permitted to write a JournalEntry. No other module may propose a balance mutation that bypasses it.</li><li>Every JournalEntry is balanced (debits = credits), atomic, immutable, and idempotent (keyed on sourceEventId). There is no update or delete path.</li><li>Every synchronous interface is an OpenAPI 3.1 contract; every asynchronous interface is an AsyncAPI 2.6 contract, before implementation.</li><li>Every capability affecting money movement is gated by a feature flag via FeatureFlagClient, with both an engineering owner and a finance/risk owner named.</li></ul>
+<ul class="constraint-list"><li>Each module owns its own data store; cross-module reads use published domain events or a synchronous OpenAPI call to the owning module — never direct database access.</li><li>CRM has no path into the Posting Engine at all. If a design routes a CRM capability through GL, that is a design error, not a shortcut.</li><li>The General Ledger &amp; Posting Engine is the ONLY component permitted to write a JournalEntry. No other module may propose a balance mutation that bypasses it.</li><li>Every JournalEntry is balanced (debits = credits), atomic, immutable, and idempotent (keyed on sourceEventId). There is no update or delete path.</li><li>Every synchronous interface is an OpenAPI 3.1 contract; every asynchronous interface is an AsyncAPI 2.6 contract, before implementation.</li><li>Every capability affecting money movement is gated by a feature flag via FeatureFlagClient, with both an engineering owner and a finance/risk owner named.</li><li>[As-implemented] Money is always {amount: integer minor-units, currency: ISO 4217} — never a bare float — via the shared schema at specs/schemas/money.schema.json.</li><li>[As-implemented] Every balance-affecting operation's idempotency key travels as a required Idempotency-Key header, not a request-body field — except the two batch-trigger operations (runDailyAccrual, runDailyDelinquencyAssessment), which are idempotent by construction on their own (asOf, partitionIndex) body parameters.</li><li>[As-implemented] Every posted JournalEntry line carries runningBalanceAfter (Money) — callers never need a separate read to confirm a posting's effect.</li><li>[As-implemented] Event topics follow "&lt;context&gt;.&lt;entity&gt;.&lt;eventPastTense&gt;", no version suffix (version lives only in each AsyncAPI file's info.version).</li></ul>
 
 <h3>Shared Conventions Used Throughout</h3>
 <ul>
-<li>GL exposes one generic endpoint, <code>POST /journal-entries</code> (idempotent on <code>sourceEventId</code>), extended per epic with new posting-rule codes (<code>PR-&lt;EPIC&gt;-&lt;NN&gt;</code>) — never a bespoke posting endpoint per epic.</li>
-<li>Spec files live under <code>/specs/openapi/*.yaml</code> (sync) and <code>/specs/asyncapi/*.yaml</code> (async).</li>
+<li>GL exposes one generic endpoint, <code>POST /journal-entries</code> (idempotent on the <code>Idempotency-Key</code> header, which GL persists as the response's <code>sourceEventId</code>), extended per epic with new posting-rule codes (<code>PR-&lt;EPIC&gt;-&lt;NN&gt;</code>) — never a bespoke posting endpoint per epic. Three mutually-exclusive request shapes now exist: <code>amount</code> (single-line rules), <code>allocation</code> (fee/interest/principal split against a Cash or Allowance debit), and <code>capitalization</code> (interest/fee split against a LoanReceivable debit, CB-MOD only).</li>
+<li>Spec files live under <code>specs/openapi/*.yaml</code> (sync), <code>specs/asyncapi/*.yaml</code> (async), and <code>specs/schemas/*.json</code> (shared objects — Money, Error, Party, JournalEntry, LoanAccount, PaymentInstruction, ServiceCase — referenced via <code>$ref</code>, never duplicated inline).</li>
 <li>Cross-module reads are either a synchronous OpenAPI call to the owning module, or a subscription to that module's published event — never a direct database read.</li>
+<li>Money is always <code>{amount: integer minor-units, currency: ISO 4217}</code>, never a bare float. Every event topic follows <code>&lt;context&gt;.&lt;entity&gt;.&lt;eventPastTense&gt;</code>, no version suffix.</li>
 </ul>
 
+<div class="cross-note" style="margin: 14px 0;"><strong>On the receiveRepaymentNotification unification (CB-REPAY, CB-PAYOFF, CB-CHARGEOFF):</strong> CB-REPAY, CB-PAYOFF, and CB-CHARGEOFF's recovery flow were each originally designed around PAY publishing an inbound-payment event that AccountAPI subscribes to. During implementation this was retrofitted into a single unified synchronous entry point, AccountAPI's receiveRepaymentNotification (POST /repayments:notify) — the API/Event Spec Agent's rules name this explicitly as one of the three canonical balance-affecting operations, which a pure subscribe-side event cannot satisfy (no Idempotency-Key header, no 409 response, is possible on a Kafka consumer). PaymentAPI now calls this endpoint directly and synchronously the moment an inbound payment arrives; the async event (renamed payment.inbound.received) still publishes for other consumers and audit, but is no longer what triggers processing. Inside that one endpoint, AccountAPI branches three ways, checked in this order: (1) matched loan account already ChargedOff → always a recovery (PR-CHGOFF-02), regardless of any payoff quote reference; (2) a valid, unexpired payoffQuoteId present and amount-matched → payoff (PR-PAYOFF-01); (3) otherwise → ordinary repayment waterfall (PR-REPAY-01). This is a real architectural consolidation, not just a rename — the three epics below describe their own trigger step in terms of this shared endpoint rather than three separate flows.</div>
+
+<div class="cross-note" style="margin: 14px 0;"><strong>On this document's regeneration:</strong> This document was originally written as a pre-implementation design scaffold, before the API/Event Spec Agent authored the actual OpenAPI/AsyncAPI contracts now living under specs/. It has been regenerated to match what was actually built — module abbreviations above are kept for readability, each now mapped to its formal Adapter name; interaction sequences reference the real operationIds, event names, and topics; and every gap between the original design notes and the shipped contracts found during implementation is called out explicitly below, not silently smoothed over. specs/CHANGELOG.md remains the authoritative, file-by-file record.</div>
+
 <h3>Document Coverage</h3>
-<p>8 design notes &middot; 46 interaction-sequence steps &middot; 11 new posting rules
-&middot; 24 spec-file changes &middot; 17 domain events &middot; 11 feature flags.</p>
+<p>8 design notes &middot; 49 interaction-sequence steps &middot; 11 new posting rules
+&middot; 33 spec-file changes &middot; 22 domain events &middot; 11 feature flags.</p>
 
 <h3>Table of Contents</h3>
 <ol class="toc"><li><a href="#CB-BOOK">2. Loan Account Booking <span class="toc-id">[CB-BOOK]</span></a></li><li><a href="#CB-DISB">3. Loan Disbursement Processing <span class="toc-id">[CB-DISB]</span></a></li><li><a href="#CB-ACCR">4. Daily Interest Accrual <span class="toc-id">[CB-ACCR]</span></a></li><li><a href="#CB-REPAY">5. Loan Repayment Processing <span class="toc-id">[CB-REPAY]</span></a></li><li><a href="#CB-DELINQ">6. Delinquency &amp; Past-Due Fee Assessment <span class="toc-id">[CB-DELINQ]</span></a></li><li><a href="#CB-PAYOFF">7. Early Settlement / Loan Payoff <span class="toc-id">[CB-PAYOFF]</span></a></li><li><a href="#CB-CHARGEOFF">8. Loan Charge-off &amp; Write-off <span class="toc-id">[CB-CHARGEOFF]</span></a></li><li><a href="#CB-MOD">9. Loan Modification (Rate/Term Change) <span class="toc-id">[CB-MOD]</span></a></li></ol>
@@ -103,10 +109,10 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       <h2><span class="epic-num">1</span> Loan Account Booking <span class="epic-id">[CB-BOOK]</span></h2>
 
       <h3>1. Module Ownership</h3>
-      <p class="ownership">LAS owns account creation and the term-version store. PTY is queried synchronously for party validation (not read directly). CRM and BEOD are event subscribers only. <strong>GL is not invoked</strong> — booking is intentionally a zero-posting epic.</p>
+      <p class="ownership">LAS (AccountAPI) owns account creation and the term-version store. PTY (PartyAPI) is queried synchronously for party validation (not read directly). CRM and BEOD are event subscribers only. <strong>GL is not invoked</strong> — booking is intentionally a zero-posting epic.</p>
 
       <h3>2. Interaction Sequence</h3>
-      <ol class="sequence"><li>Origination system calls <code>LAS: POST /loan-accounts:book</code> (idempotent on <code>approvalReferenceId</code>) — REQ-BOOK-001, 004.</li><li>LAS synchronously calls <code>PTY: GET /parties/{partyId}</code> to confirm Active + KYC Verified — REQ-BOOK-002.</li><li>LAS creates the account (status Approved) with immutable term version v1 — REQ-BOOK-003, 006.</li><li>LAS publishes <code>LoanAccountBooked</code> — CRM logs an interaction (REQ-BOOK-005); BEOD tracks it for the approvals-vs-bookings check (REQ-BOOK-007).</li><li><strong>No Posting Engine call at any step</strong> — a deliberate absence, not an oversight.</li></ol>
+      <ol class="sequence"><li>Origination system calls <code>AccountAPI: POST /loan-accounts:book</code> — idempotent on the <code>Idempotency-Key</code> header (value = approvalReferenceId; no longer a request-body field) — REQ-BOOK-001, 004.</li><li>AccountAPI synchronously calls <code>PartyAPI: GET /parties/{partyId}</code> to confirm Active + KYC Verified — REQ-BOOK-002.</li><li>AccountAPI creates the account (status Approved) with immutable term version v1 (shared LoanAccount/TermVersion schema, principalAmount as Money, rate as annualInterestRateBps) — REQ-BOOK-003, 006.</li><li>AccountAPI publishes <code>LoanAccountBooked</code> on topic <code>loan.account.booked</code> — CRM logs an interaction via CRMAPI's <code>logInteraction</code> (REQ-BOOK-005); BEOD tracks it for the approvals-vs-bookings check (REQ-BOOK-007).</li><li>Rejection path (malformed terms or failed party validation): synchronous 400/422, AND AccountAPI publishes <code>LoanBookingRejected</code> on topic <code>loan.booking.rejected</code> to BEOD's exception queue (REQ-BOOK-001's explicit "exception queue" language) — present in the shipped contract but absent from the original design note's domain-events table; added here to match.</li><li><strong>No Posting Engine call at any step</strong> — a deliberate absence, not an oversight.</li></ol>
 
       
         <h3>Posting-Rule Impact</h3>
@@ -116,13 +122,13 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       <h3>3. Spec Files (New / Modified)</h3>
       <table class="spec-table">
         <thead><tr><th>File</th><th>Purpose</th></tr></thead>
-        <tbody><tr><td class='code'>/specs/openapi/loan-account-subledger.yaml</td><td>add POST /loan-accounts:book</td></tr><tr><td class='code'>/specs/asyncapi/loan-account-subledger-events.yaml</td><td>new channel loan.account.booked.v1</td></tr></tbody>
+        <tbody><tr><td class='code'>specs/openapi/loan-account-subledger.yaml</td><td>POST /loan-accounts:book, GET /loan-accounts/{id}</td></tr><tr><td class='code'>specs/asyncapi/loan-account-subledger-events.yaml</td><td>channels loan.account.booked, loan.booking.rejected</td></tr><tr><td class='code'>specs/schemas/loan-account.schema.json</td><td>shared TermSet/TermVersion/LoanAccount, referenced via $ref</td></tr><tr><td class='code'>specs/schemas/party.schema.json</td><td>shared Party object returned by PartyAPI</td></tr></tbody>
       </table>
 
       <h3>4. Domain Events</h3>
       <table class="event-table">
         <thead><tr><th>Event</th><th>Producer</th><th>Consumer(s)</th></tr></thead>
-        <tbody><tr><td class='code'>LoanAccountBooked</td><td>LAS</td><td>CRM, BEOD</td></tr></tbody>
+        <tbody><tr><td class='code'>LoanAccountBooked (loan.account.booked)</td><td>AccountAdapter</td><td>CRMAdapter, BatchEodAdapter</td></tr><tr><td class='code'>LoanBookingRejected (loan.booking.rejected)</td><td>AccountAdapter</td><td>BatchEodAdapter</td></tr></tbody>
       </table>
 
       <h3>5. Feature Flags</h3>
@@ -137,17 +143,17 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       </table>
 
       <h3>6. NFR &amp; Security Implications</h3>
-      <ul class="nfr-list"><li>Synchronous PTY dependency needs a timeout + fail-closed circuit breaker (reject booking rather than silently skip KYC on timeout).</li><li>Events carry partyId only, no PII payload.</li><li>Term-version creation is logged with actor + approvalReferenceId for exam trail.</li><li>Adds one new BEOD reconciliation job (approvals vs. bookings).</li></ul>
+      <ul class="nfr-list"><li>Synchronous PartyAPI dependency needs a timeout + fail-closed circuit breaker (reject booking rather than silently skip KYC on timeout).</li><li>Events carry partyId only, no PII payload.</li><li>Term-version creation is logged with actor + approvalReferenceId for exam trail.</li><li>Adds one new BEOD reconciliation job (approvals vs. bookings).</li><li>[As-implemented] No Idempotency-Key is required by rule for this operation strictly (booking posts no balance), but the retrofit applies the header uniformly to every creation-style operation for consistency — see the Idempotency-Key convention note in Architecture Context.</li></ul>
     </section>
     
     <section class="epic" id="CB-DISB">
       <h2><span class="epic-num">2</span> Loan Disbursement Processing <span class="epic-id">[CB-DISB]</span></h2>
 
       <h3>1. Module Ownership</h3>
-      <p class="ownership">LAS owns the disbursement state machine and orchestrates PTY/GL/PAY calls. GL owns the funding posting. PAY owns payment execution. CRM/BEOD are subscribers.</p>
+      <p class="ownership">LAS (AccountAPI) owns the disbursement state machine and orchestrates PTY/GL/PAY calls. GL (GLPostingAPI) owns the funding posting. PAY (PaymentAPI) owns payment execution. CRM/BEOD are subscribers.</p>
 
       <h3>2. Interaction Sequence</h3>
-      <ol class="sequence"><li><code>LAS: POST /loan-accounts/{id}/disbursements</code> (idempotent on disbursementId), status → Pending Disbursement — REQ-DISB-001.</li><li>LAS → <code>PTY: GET /parties/{partyId}</code>; reject with reason code on failure — REQ-DISB-002.</li><li>LAS → <code>GL: POST /journal-entries</code>, rule <strong>PR-DISB-01</strong> (Dr LoanReceivable P / Cr Cash-Nostro P), sourceEventId=disbursementId — REQ-DISB-003.</li><li>On GL confirmation, LAS → <code>PAY: POST /payments:disburse</code> (idempotent on disbursementId) — REQ-DISB-004.</li><li>PaymentExecuted → LAS sets status Disbursed, publishes LoanAccountDisbursed → CRM (REQ-DISB-005), BEOD (REQ-DISB-006).</li><li>PaymentFailed/returned → LAS → GL posts <strong>PR-DISB-02</strong> (reversal of PR-DISB-01, new sourceEventId), status reverts to Approved only after GL confirms — REQ-DISB-007.</li></ol>
+      <ol class="sequence"><li><code>AccountAPI: POST /loan-accounts/{id}/disbursements</code> — Idempotency-Key header (value = disbursementId), status → Pending Disbursement — REQ-DISB-001.</li><li>AccountAPI → <code>PartyAPI: GET /parties/{partyId}</code>; reject with reason code on failure — REQ-DISB-002.</li><li>AccountAPI → <code>GLPostingAPI: POST /journal-entries</code>, rule <strong>PR-DISB-01</strong> (Dr LoanReceivable P / Cr Cash-Nostro P), Idempotency-Key = disbursementId — REQ-DISB-003. Response now includes <code>runningBalanceAfter</code> (Money) per line.</li><li>On GL confirmation, AccountAPI → <code>PaymentAPI: POST /payment-instructions:disburse</code> (operationId <code>initiateDisbursement</code> — renamed from the original disbursePayment/{id}:disburse draft), Idempotency-Key = disbursementId — REQ-DISB-004. Response is the shared <code>PaymentInstruction</code> object.</li><li><code>payment.disbursement.confirmed</code> (renamed from PaymentExecuted/payment.executed.v1) → AccountAPI sets status Disbursed, publishes <code>LoanAccountDisbursed</code> on <code>loan.account.disbursed</code> → CRM (REQ-DISB-005), BEOD (REQ-DISB-006).</li><li><code>payment.disbursement.failed</code> (renamed from PaymentFailed/payment.failed.v1) → AccountAPI → GL posts <strong>PR-DISB-02</strong> (reversal of PR-DISB-01, new Idempotency-Key = disbursementId:reverse), status reverts to Approved only after GL confirms — REQ-DISB-007.</li></ol>
 
       
         <h3>Posting-Rule Impact</h3>
@@ -160,13 +166,13 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       <h3>3. Spec Files (New / Modified)</h3>
       <table class="spec-table">
         <thead><tr><th>File</th><th>Purpose</th></tr></thead>
-        <tbody><tr><td class='code'>/specs/openapi/loan-account-subledger.yaml</td><td>add POST .../disbursements</td></tr><tr><td class='code'>/specs/openapi/gl-posting-engine.yaml</td><td>register PR-DISB-01, PR-DISB-02</td></tr><tr><td class='code'>/specs/openapi/payment-execution.yaml</td><td>add POST /payments:disburse</td></tr><tr><td class='code'>/specs/asyncapi/payment-execution-events.yaml</td><td>new channels payment.executed.v1, payment.failed.v1</td></tr></tbody>
+        <tbody><tr><td class='code'>specs/openapi/loan-account-subledger.yaml</td><td>POST/GET .../disbursements, POST .../disbursements/{id}:reverse</td></tr><tr><td class='code'>specs/openapi/gl-posting-engine.yaml</td><td>register PR-DISB-01, PR-DISB-02</td></tr><tr><td class='code'>specs/openapi/payment-execution.yaml</td><td>POST /payment-instructions:disburse, GET /payment-instructions/{id}</td></tr><tr><td class='code'>specs/asyncapi/payment-execution-events.yaml</td><td>channels payment.disbursement.confirmed, payment.disbursement.failed</td></tr><tr><td class='code'>specs/schemas/payment-instruction.schema.json</td><td>shared PaymentInstruction object</td></tr><tr><td class='code'>specs/schemas/journal-entry.schema.json</td><td>shared JournalEntry response with runningBalanceAfter</td></tr></tbody>
       </table>
 
       <h3>4. Domain Events</h3>
       <table class="event-table">
         <thead><tr><th>Event</th><th>Producer</th><th>Consumer(s)</th></tr></thead>
-        <tbody><tr><td class='code'>JournalEntryPosted (Disbursement)</td><td>GL</td><td>LAS, BEOD</td></tr><tr><td class='code'>PaymentExecuted / PaymentFailed</td><td>PAY</td><td>LAS</td></tr><tr><td class='code'>LoanAccountDisbursed</td><td>LAS</td><td>CRM, BEOD</td></tr></tbody>
+        <tbody><tr><td class='code'>JournalEntryPosted (gl.entry.posted, filtered PR-DISB-*)</td><td>GLPostingAdapter</td><td>AccountAdapter, BatchEodAdapter</td></tr><tr><td class='code'>PaymentDisbursementConfirmed / PaymentDisbursementFailed</td><td>PaymentAdapter</td><td>AccountAdapter</td></tr><tr><td class='code'>LoanAccountDisbursed</td><td>AccountAdapter</td><td>CRMAdapter, BatchEodAdapter</td></tr></tbody>
       </table>
 
       <h3>5. Feature Flags</h3>
@@ -175,23 +181,23 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
         <tbody><tr>
               <td class='code'>loan.disbursement.enabled</td>
               <td>boolean kill-switch</td>
-              <td>Shadow-post (compute, no PAY call) 1 week → 5% live volume → 25% → 100%, auto-rollback on reversal-rate SLO breach</td>
+              <td>Shadow-post (compute, no PaymentAPI call) 1 week → 5% live volume → 25% → 100%, auto-rollback on reversal-rate SLO breach</td>
               <td>Eng: Loan Subledger lead<br>Risk: Treasury Ops lead</td>
             </tr></tbody>
       </table>
 
       <h3>6. NFR &amp; Security Implications</h3>
-      <ul class="nfr-list"><li>GL post target p95 &lt; 200ms; PAY call can ack async (202) with status updates via event.</li><li>Borrower account/routing details stay inside PAY, never in the disbursement event payload.</li><li>Every state transition logged with correlationId=disbursementId.</li><li>New BEOD daily total-variance check (REQ-DISB-006).</li></ul>
+      <ul class="nfr-list"><li>GL post target p95 &lt; 200ms; PaymentAPI call acks async (202) with status updates via event.</li><li>Borrower account/routing details stay inside PaymentAPI, never in the disbursement event payload.</li><li>Every state transition logged with correlationId=disbursementId.</li><li>New BEOD daily total-variance check (REQ-DISB-006).</li><li>[As-implemented] gl.entry.posted's per-line runningBalanceAfter means BEOD's daily variance check no longer needs a second read to confirm each posting's effect on the loan account balance.</li></ul>
     </section>
     
     <section class="epic" id="CB-ACCR">
       <h2><span class="epic-num">3</span> Daily Interest Accrual <span class="epic-id">[CB-ACCR]</span></h2>
 
       <h3>1. Module Ownership</h3>
-      <p class="ownership">BEOD orchestrates the daily run; LAS computes eligibility and the accrual amount (using the term version in effect — see CB-MOD dependency); GL posts. No CRM touchpoint in this epic.</p>
+      <p class="ownership">BEOD orchestrates the daily run; LAS (AccountAPI) computes eligibility and the accrual amount (resolving the effective term version — see CB-MOD dependency); GL posts. No CRM touchpoint in this epic.</p>
 
       <h3>2. Interaction Sequence</h3>
-      <ol class="sequence"><li>BEOD triggers the accrual job for date D.</li><li>BEOD → <code>LAS: GET /loan-accounts:accrual-eligible?asOf=D</code> — REQ-ACCR-001, 005.</li><li>LAS computes X per account from rate/day-count/principal as of start-of-D, applying the payoff/closure cutoff — REQ-ACCR-004, 006.</li><li>LAS → <code>GL: POST /journal-entries</code>, rule <strong>PR-ACCR-01</strong> (Dr InterestReceivable X / Cr InterestIncome X), sourceEventId=accr:{loanAccountId}:{D} — REQ-ACCR-002, 003.</li><li>BEOD cross-checks eligible-account count vs. posted-entry count at batch close, raises AccrualExceptionRaised on mismatch — REQ-ACCR-007.</li></ol>
+      <ol class="sequence"><li>BEOD triggers the accrual job for date D.</li><li>BEOD → <code>AccountAPI: GET /loan-accounts:accrual-eligible?asOf=D</code> — REQ-ACCR-001, 005.</li><li>BEOD → <code>AccountAPI: POST /loan-accounts:accrue</code> — the actual batch-execution trigger. <strong>Gap fixed vs. the original design note</strong>: the note only ever specified the eligibility GET; nothing triggered per-account computation and posting. This endpoint (no Idempotency-Key header — idempotent by construction on its own asOf/partitionIndex body) does that: for each eligible account it resolves rate/day-count/principal-basis from the term version effective as of D (REQ-CB-MOD-006), computes X, and posts PR-ACCR-01.</li><li>AccountAPI → <code>GLPostingAPI: POST /journal-entries</code>, rule <strong>PR-ACCR-01</strong> (Dr InterestReceivable X / Cr InterestIncome X), Idempotency-Key = accr:{loanAccountId}:{D} — REQ-ACCR-002, 003. metadata carries businessDate/annualInterestRateBps/dayCountConvention/principalBasis/termVersion for audit reproducibility (REQ-ACCR-004).</li><li>BEOD cross-checks eligible-account count vs. posted-entry count (via gl.entry.posted filtered to PR-ACCR-01) at batch close, raises <code>accrual.exception.raised</code> on mismatch — REQ-ACCR-007.</li></ol>
 
       
         <h3>Posting-Rule Impact</h3>
@@ -204,13 +210,13 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       <h3>3. Spec Files (New / Modified)</h3>
       <table class="spec-table">
         <thead><tr><th>File</th><th>Purpose</th></tr></thead>
-        <tbody><tr><td class='code'>/specs/openapi/loan-account-subledger.yaml</td><td>add GET .../accrual-eligible</td></tr><tr><td class='code'>/specs/openapi/gl-posting-engine.yaml</td><td>register PR-ACCR-01</td></tr><tr><td class='code'>/specs/asyncapi/batch-eod-events.yaml</td><td>new channel accrual.exception.raised.v1</td></tr></tbody>
+        <tbody><tr><td class='code'>specs/openapi/loan-account-subledger.yaml</td><td>GET .../accrual-eligible, POST /loan-accounts:accrue (the batch-trigger action the original design note omitted)</td></tr><tr><td class='code'>specs/openapi/gl-posting-engine.yaml</td><td>register PR-ACCR-01; metadata field added to PostJournalEntryRequest/JournalEntry for audit context</td></tr><tr><td class='code'>specs/asyncapi/batch-eod-events.yaml</td><td>channel accrual.exception.raised (renamed from accrual.exception.raised.v1)</td></tr></tbody>
       </table>
 
       <h3>4. Domain Events</h3>
       <table class="event-table">
         <thead><tr><th>Event</th><th>Producer</th><th>Consumer(s)</th></tr></thead>
-        <tbody><tr><td class='code'>JournalEntryPosted (Accrual)</td><td>GL</td><td>BEOD</td></tr><tr><td class='code'>AccrualExceptionRaised</td><td>BEOD</td><td>Ops/BEOD dashboard</td></tr></tbody>
+        <tbody><tr><td class='code'>JournalEntryPosted (gl.entry.posted, filtered PR-ACCR-01)</td><td>GLPostingAdapter</td><td>BatchEodAdapter</td></tr><tr><td class='code'>AccrualExceptionRaised (accrual.exception.raised)</td><td>BatchEodAdapter</td><td>Ops/Financial-Reporting (human, not a module — see x-consumers: [] in the AsyncAPI file)</td></tr></tbody>
       </table>
 
       <h3>5. Feature Flags</h3>
@@ -225,17 +231,17 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       </table>
 
       <h3>6. NFR &amp; Security Implications</h3>
-      <ul class="nfr-list"><li>Must complete within the overnight window — partition eligible accounts, don't loop serially over the full portfolio.</li><li>Every PR-ACCR-01 entry retains rate/day-count/principal as structured metadata for exam reproducibility (REQ-ACCR-004).</li><li>This epic is itself a reconciliation control; no separate downstream recon needed.</li></ul>
+      <ul class="nfr-list"><li>Must complete within the overnight window — both accrual-eligible and accrue support partitionIndex/partitionCount fan-out, operationalizing this NFR directly in the contract rather than leaving it as prose.</li><li>Every PR-ACCR-01 entry retains rate/day-count/principal as structured metadata for exam reproducibility (REQ-ACCR-004).</li><li>This epic is itself a reconciliation control; no separate downstream recon needed.</li><li>[As-implemented] Rate resolution now goes through the effective-dated term-version lookup CB-MOD introduces, not a single static rate field — see the receiveRepaymentNotification-adjacent cross-epic note and Appendix A.</li></ul>
     </section>
     
     <section class="epic" id="CB-REPAY">
       <h2><span class="epic-num">4</span> Loan Repayment Processing <span class="epic-id">[CB-REPAY]</span></h2>
 
       <h3>1. Module Ownership</h3>
-      <p class="ownership">PAY receives the inbound payment; LAS owns matching and waterfall allocation; GL posts; CRM logs.</p>
+      <p class="ownership">PAY (PaymentAPI) receives the inbound payment and calls AccountAPI synchronously; LAS (AccountAPI) owns matching and waterfall allocation; GL posts; CRM logs. <strong>See the receive­RepaymentNotification unification note in Architecture Context</strong> — this epic's trigger step changed materially from the original design.</p>
 
       <h3>2. Interaction Sequence</h3>
-      <ol class="sequence"><li>PAY publishes PaymentReceived (paymentReferenceId, amount, loanAccountRef).</li><li>LAS matches to exactly one account — REQ-REPAY-001; ambiguous/no match → PaymentUnmatched to BEOD's exception queue.</li><li>LAS computes waterfall (fees → interest → principal) — REQ-REPAY-002.</li><li>LAS → <code>GL: POST /journal-entries</code>, rule <strong>PR-REPAY-01</strong> (Dr Cash/Nostro P / Cr FeeReceivable + InterestReceivable + LoanReceivable per allocation — clearing receivables already recognized at accrual/assessment time, never re-crediting Income), idempotent on paymentReferenceId — REQ-REPAY-003, 004.</li><li>LAS publishes LoanRepaymentPosted → CRM — REQ-REPAY-005.</li><li>BEOD cross-checks all PaymentReceived against posted/unmatched outcomes — REQ-REPAY-006.</li><li>Reversal: <code>LAS: POST /repayments/{id}:reverse</code> → GL posts <strong>PR-REPAY-02</strong> (offsetting); misapplied case re-runs the waterfall against the correct account as a fresh PR-REPAY-01 with a new sourceEventId — REQ-REPAY-007.</li></ol>
+      <ol class="sequence"><li>PaymentAPI receives an inbound payment and calls <code>AccountAPI: POST /repayments:notify</code> (operationId <code>receiveRepaymentNotification</code>) synchronously — Idempotency-Key header = paymentReferenceId. This REPLACES the original "PAY publishes PaymentReceived, LAS subscribes" design; the async event (renamed <code>payment.inbound.received</code>) still publishes, now for observability/audit only.</li><li>AccountAPI matches <code>loanAccountRef</code> to exactly one active loan account — REQ-REPAY-001; ambiguous/no match publishes <code>payment.match.failed</code> (renamed from PaymentUnmatched) to BEOD's exception queue, and returns a Repayment with status Unmatched — still 201/200, not an error.</li><li>Not a payoff, not a recovery (see the three-way branch in the unification note): AccountAPI computes the waterfall (fees → interest → principal) — REQ-REPAY-002.</li><li>AccountAPI → <code>GLPostingAPI: POST /journal-entries</code>, rule <strong>PR-REPAY-01</strong> (Dr Cash/Nostro P / Cr FeeReceivable + InterestReceivable + LoanReceivable per <code>allocation</code> — clearing receivables already recognized at accrual/assessment time, never re-crediting Income) — REQ-REPAY-003, 004.</li><li>AccountAPI publishes <code>LoanRepaymentPosted</code> on <code>loan.repayment.posted</code> → CRM — REQ-REPAY-005.</li><li>BEOD cross-checks all received payments against posted/unmatched/reversed outcomes, raising <code>repayment.exception.raised</code> for anything left in a non-terminal state at EOD cutoff — REQ-REPAY-006.</li><li>Reversal: <code>AccountAPI: POST /repayments/{id}:reverse</code> (Idempotency-Key = {repaymentId}:reverse) → GL posts <strong>PR-REPAY-02</strong> (offsetting); misapplied case re-runs the waterfall against the correct account as a fresh PR-REPAY-01 under a new Idempotency-Key ({repaymentId}:correction) — REQ-REPAY-007.</li></ol>
 
       
         <h3>Posting-Rule Impact</h3>
@@ -248,13 +254,13 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       <h3>3. Spec Files (New / Modified)</h3>
       <table class="spec-table">
         <thead><tr><th>File</th><th>Purpose</th></tr></thead>
-        <tbody><tr><td class='code'>/specs/asyncapi/payment-execution-events.yaml</td><td>new channel payment.received.v1</td></tr><tr><td class='code'>/specs/openapi/loan-account-subledger.yaml</td><td>add POST .../repayments/{id}:reverse</td></tr><tr><td class='code'>/specs/openapi/gl-posting-engine.yaml</td><td>register PR-REPAY-01, PR-REPAY-02</td></tr></tbody>
+        <tbody><tr><td class='code'>specs/asyncapi/payment-execution-events.yaml</td><td>channel payment.inbound.received (renamed from payment.received.v1; observability-only now, not the trigger)</td></tr><tr><td class='code'>specs/openapi/loan-account-subledger.yaml</td><td>POST /repayments:notify (receiveRepaymentNotification — the new authoritative synchronous trigger), GET /repayments/{id}, POST /repayments/{id}:reverse</td></tr><tr><td class='code'>specs/openapi/gl-posting-engine.yaml</td><td>register PR-REPAY-01, PR-REPAY-02; Allocation schema (categorized fee/interest/principal split, Money-based)</td></tr><tr><td class='code'>specs/asyncapi/loan-account-subledger-events.yaml</td><td>channels payment.match.failed (renamed from payment.unmatched.v1), loan.repayment.posted</td></tr><tr><td class='code'>specs/asyncapi/batch-eod-events.yaml</td><td>channel repayment.exception.raised — present in the shipped contract but missing from the original design note's domain-events table; added here to match</td></tr></tbody>
       </table>
 
       <h3>4. Domain Events</h3>
       <table class="event-table">
         <thead><tr><th>Event</th><th>Producer</th><th>Consumer(s)</th></tr></thead>
-        <tbody><tr><td class='code'>PaymentReceived</td><td>PAY</td><td>LAS</td></tr><tr><td class='code'>PaymentUnmatched</td><td>LAS</td><td>BEOD</td></tr><tr><td class='code'>LoanRepaymentPosted</td><td>LAS</td><td>CRM</td></tr></tbody>
+        <tbody><tr><td class='code'>PaymentInboundReceived (payment.inbound.received)</td><td>PaymentAdapter</td><td>BatchEodAdapter (observability only — no longer drives AccountAdapter processing)</td></tr><tr><td class='code'>PaymentMatchFailed (payment.match.failed)</td><td>AccountAdapter</td><td>BatchEodAdapter</td></tr><tr><td class='code'>LoanRepaymentPosted (loan.repayment.posted)</td><td>AccountAdapter</td><td>CRMAdapter</td></tr><tr><td class='code'>RepaymentExceptionRaised (repayment.exception.raised)</td><td>BatchEodAdapter</td><td>Ops/Financial-Reporting (human)</td></tr></tbody>
       </table>
 
       <h3>5. Feature Flags</h3>
@@ -269,17 +275,17 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       </table>
 
       <h3>6. NFR &amp; Security Implications</h3>
-      <ul class="nfr-list"><li>Match→allocate→post should complete within seconds to hold same-day posting SLA.</li><li>PaymentReceived carries reference IDs only, not payer bank details.</li><li>Waterfall breakdown stored as line-item metadata for dispute resolution.</li><li>Unmatched-payment queue needs its own alerting SLA, not just EOD visibility.</li><li>Income-recognition principle: PR-REPAY-01 clears Cash against Fee/Interest/Loan Receivable — it never credits Fee/Interest Income directly, since that income was already recognized once at accrual (PR-ACCR-01) or assessment (PR-DELINQ-01) time. Crediting Income again here would double-count it.</li></ul>
+      <ul class="nfr-list"><li>Match→allocate→post should complete within seconds to hold same-day posting SLA — now a hard synchronous-call latency budget, not just an async-processing target, since PaymentAPI blocks on receiveRepaymentNotification's response.</li><li>PaymentInboundReceived/receiveRepaymentNotification carry reference IDs only, not payer bank details.</li><li>Waterfall breakdown stored as line-item metadata for dispute resolution.</li><li>Unmatched-payment queue needs its own alerting SLA, not just EOD visibility.</li><li>Income-recognition principle: PR-REPAY-01 clears Cash against Fee/Interest/Loan Receivable — it never credits Fee/Interest Income directly, since that income was already recognized once at accrual (PR-ACCR-01) or assessment (PR-DELINQ-01) time. Crediting Income again here would double-count it. (This was a real documentation error in this design note's first draft, corrected during the API/Event Spec Agent implementation pass — see specs/CHANGELOG.md's v0.3.0 entry.)</li></ul>
     </section>
     
     <section class="epic" id="CB-DELINQ">
       <h2><span class="epic-num">5</span> Delinquency &amp; Past-Due Fee Assessment <span class="epic-id">[CB-DELINQ]</span></h2>
 
       <h3>1. Module Ownership</h3>
-      <p class="ownership">BEOD orchestrates; LAS owns DPD/fee computation and the Non-Accrual flag; GL posts; CRM logs.</p>
+      <p class="ownership">BEOD orchestrates; LAS (AccountAPI) owns DPD/fee computation and the Non-Accrual flag; GL posts; CRM logs.</p>
 
       <h3>2. Interaction Sequence</h3>
-      <ol class="sequence"><li>BEOD triggers the delinquency job for date D; LAS updates DPD buckets — REQ-DELINQ-001, 003.</li><li>Past-grace-period accounts: LAS → <code>GL: POST /journal-entries</code>, rule <strong>PR-DELINQ-01</strong> (Dr FeeReceivable / Cr FeeIncome) — REQ-DELINQ-002, 004.</li><li>DPD threshold crossing → LAS sets a Non-Accrual flag, read by <strong>CB-ACCR step 2</strong> as an eligibility filter — REQ-DELINQ-005 (cross-epic dependency, not a new posting).</li><li>LAS publishes DelinquencyStatusChanged → CRM — REQ-DELINQ-006.</li><li>BEOD cross-checks fee postings vs. DPD changes — REQ-DELINQ-008.</li><li>Waiver: <code>LAS: POST /fees/{id}:waive</code> with authorization metadata → GL posts <strong>PR-DELINQ-02</strong> (reversal) — REQ-DELINQ-007.</li></ol>
+      <ol class="sequence"><li>BEOD triggers the delinquency job for date D.</li><li>BEOD → <code>AccountAPI: GET /loan-accounts:past-due?asOf=D</code> — REQ-DELINQ-001.</li><li>BEOD → <code>AccountAPI: POST /loan-accounts:assess-delinquency</code> — the actual batch-execution trigger. <strong>Gap fixed vs. the original design note</strong>: same omission pattern as CB-ACCR — the note specified only the read, not the trigger. No Idempotency-Key header (idempotent by construction on asOf/partitionIndex). Updates DPD count/bucket for every account EXCLUDING those already ChargedOff (REQ-CHARGEOFF-005) — REQ-DELINQ-003.</li><li>Past-grace-period accounts: AccountAPI → <code>GLPostingAPI: POST /journal-entries</code>, rule <strong>PR-DELINQ-01</strong> (Dr FeeReceivable / Cr FeeIncome), Idempotency-Key = late-fee:{loanAccountId}:{scheduledDueDate} — REQ-DELINQ-002, 004.</li><li>DPD threshold crossing → AccountAPI sets LoanAccount.nonAccrualFlag, publishes <code>LoanNonAccrualFlagged</code> (renamed from LoanAccountNonAccrualFlagged) on <code>loan.nonaccrual.flagged</code> — read by <strong>CB-ACCR's eligibility query</strong> as a same-service internal lookup, not via the event, which exists for BatchEodAdapter visibility/audit only — REQ-DELINQ-005 (cross-epic dependency, not a new posting).</li><li>AccountAPI publishes <code>DelinquencyStatusChanged</code> on <code>delinquency.status.changed</code> → CRM — REQ-DELINQ-006.</li><li>BEOD cross-checks fee postings vs. DPD changes, raising <code>delinquency.exception.raised</code> on mismatch in either direction — REQ-DELINQ-008. <strong>Present in the shipped contract but missing from the original design note's domain-events table</strong>; added here to match.</li><li>Waiver: <code>AccountAPI: POST /fees/{id}:waive</code> (Idempotency-Key = {feeId}:waive) with mandatory confirmedBy/reasonCode → GL posts <strong>PR-DELINQ-02</strong> (reversal), metadata carrying the same authorization pair so it travels with the ledger entry, not just AccountAPI's own record — REQ-DELINQ-007.</li></ol>
 
       
         <h3>Posting-Rule Impact</h3>
@@ -292,13 +298,13 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       <h3>3. Spec Files (New / Modified)</h3>
       <table class="spec-table">
         <thead><tr><th>File</th><th>Purpose</th></tr></thead>
-        <tbody><tr><td class='code'>/specs/openapi/loan-account-subledger.yaml</td><td>add GET .../past-due, POST /fees/{id}:waive</td></tr><tr><td class='code'>/specs/openapi/gl-posting-engine.yaml</td><td>register PR-DELINQ-01, PR-DELINQ-02</td></tr><tr><td class='code'>/specs/asyncapi/loan-account-subledger-events.yaml</td><td>new channels delinquency.status.changed.v1, loan.account.nonaccrual.v1</td></tr></tbody>
+        <tbody><tr><td class='code'>specs/openapi/loan-account-subledger.yaml</td><td>GET .../past-due, POST /loan-accounts:assess-delinquency (batch trigger the original note omitted), GET/POST /fees/{id}[:waive]</td></tr><tr><td class='code'>specs/openapi/gl-posting-engine.yaml</td><td>register PR-DELINQ-01, PR-DELINQ-02; mandatory metadata (waivedBy/reasonCode) enforced for PR-DELINQ-02</td></tr><tr><td class='code'>specs/asyncapi/loan-account-subledger-events.yaml</td><td>channels delinquency.status.changed, loan.nonaccrual.flagged (both renamed, .v1 dropped)</td></tr><tr><td class='code'>specs/asyncapi/batch-eod-events.yaml</td><td>channel delinquency.exception.raised — added to match the shipped contract</td></tr></tbody>
       </table>
 
       <h3>4. Domain Events</h3>
       <table class="event-table">
         <thead><tr><th>Event</th><th>Producer</th><th>Consumer(s)</th></tr></thead>
-        <tbody><tr><td class='code'>DelinquencyStatusChanged</td><td>LAS</td><td>CRM</td></tr><tr><td class='code'>LoanAccountNonAccrualFlagged</td><td>LAS</td><td>LAS-internal (Accrual eligibility, CB-ACCR), BEOD</td></tr></tbody>
+        <tbody><tr><td class='code'>DelinquencyStatusChanged (delinquency.status.changed)</td><td>AccountAdapter</td><td>CRMAdapter</td></tr><tr><td class='code'>LoanNonAccrualFlagged (loan.nonaccrual.flagged)</td><td>AccountAdapter</td><td>BatchEodAdapter (visibility only — CB-ACCR reads the flag same-service, not via this event)</td></tr><tr><td class='code'>DelinquencyExceptionRaised (delinquency.exception.raised)</td><td>BatchEodAdapter</td><td>Ops/Financial-Reporting (human)</td></tr></tbody>
       </table>
 
       <h3>5. Feature Flags</h3>
@@ -318,36 +324,36 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       </table>
 
       <h3>6. NFR &amp; Security Implications</h3>
-      <ul class="nfr-list"><li>Same partitioning concern as Accrual.</li><li>Waiver requires a mandatory (not optional) authorization record on PR-DELINQ-02.</li><li>Sequencing dependency: CB-ACCR's daily step must run after this epic's Non-Accrual flag update in the BEOD DAG, or accrual uses stale eligibility.</li></ul>
+      <ul class="nfr-list"><li>Same partitioning concern as Accrual — assess-delinquency supports the same partitionIndex/partitionCount fan-out.</li><li>Waiver requires a mandatory (not optional) authorization record on PR-DELINQ-02 — enforced in GL's metadata requirement, not just AccountAPI's own record.</li><li>Sequencing dependency: CB-ACCR's daily step must run after this epic's Non-Accrual flag update in the BEOD DAG, or accrual uses stale eligibility.</li></ul>
     </section>
     
     <section class="epic" id="CB-PAYOFF">
       <h2><span class="epic-num">6</span> Early Settlement / Loan Payoff <span class="epic-id">[CB-PAYOFF]</span></h2>
 
       <h3>1. Module Ownership</h3>
-      <p class="ownership">LAS owns quote generation and closure; GL posts; PAY receives the payoff payment; CRM logs; BEOD reconciles.</p>
+      <p class="ownership">LAS (AccountAPI) owns quote generation and closure; GL posts; PAY receives the payoff payment and routes it through the unified receiveRepaymentNotification entry point (see Architecture Context); CRM logs; BEOD reconciles.</p>
 
       <h3>2. Interaction Sequence</h3>
-      <ol class="sequence"><li><code>LAS: GET /loan-accounts/{id}/payoff-quote?goodThrough=G</code> — read-only, no posting — REQ-PAYOFF-001, 002, 003.</li><li>Payoff payment arrives via PAY → PaymentReceived (reused from CB-REPAY), tagged with the quote reference.</li><li>LAS validates amount/window — exact match proceeds; underpayment routes to the standard waterfall (CB-REPAY reuse); overpayment excess routes to suspense — REQ-PAYOFF-003, 007.</li><li>LAS → <code>GL: POST /journal-entries</code>, rule <strong>PR-PAYOFF-01</strong> (Dr Cash/Nostro / Cr LoanReceivable + InterestReceivable, zeroing both) — REQ-PAYOFF-004, 005.</li><li>On confirmation, LAS sets status Closed — REQ-PAYOFF-006 — and publishes LoanAccountClosed → CRM (REQ-PAYOFF-008), BEOD.</li><li>BEOD confirms true zero balance on every account closed that day — REQ-PAYOFF-009.</li></ol>
+      <ol class="sequence"><li><code>AccountAPI: GET /loan-accounts/{id}/payoff-quote?goodThrough=G</code> — read-only, no posting, returns a <code>PayoffQuote</code> with a <code>quoteId</code> — REQ-PAYOFF-001, 002, 003.</li><li>Payoff payment arrives via PaymentAPI, which calls <code>AccountAPI: POST /repayments:notify</code> with <code>payoffQuoteId</code> set — the SAME endpoint CB-REPAY uses, not a separate settlement call (see the receiveRepaymentNotification unification note).</li><li>AccountAPI validates amount/window against the quote — exact match proceeds to Branch (b) of the unified endpoint; underpayment degrades to the standard waterfall (CB-REPAY reuse, PR-REPAY-01); overpayment posts PR-PAYOFF-01 for the exact quote total and routes the excess to Payoff.suspenseAmount — REQ-PAYOFF-003, 007. An expired/not-found quote also degrades to the standard repayment path, since there is no caller left to reject to once funds have arrived.</li><li>AccountAPI → <code>GLPostingAPI: POST /journal-entries</code>, rule <strong>PR-PAYOFF-01</strong> (Dr Cash/Nostro / Cr LoanReceivable + InterestReceivable via <code>allocation</code>, zeroing both — never crediting Income) — REQ-PAYOFF-004, 005.</li><li>On confirmation, AccountAPI sets status Closed — REQ-PAYOFF-006 — and publishes <code>LoanAccountClosed</code> on <code>loan.account.closed</code> → CRM (REQ-PAYOFF-008), BEOD.</li><li>BEOD confirms true zero balance on every account closed that day, raising <code>payoff.exception.raised</code> on any residual — REQ-PAYOFF-009. <strong>Present in the shipped contract but missing from the original design note's domain-events table</strong>; added here to match.</li></ol>
 
       
         <h3>Posting-Rule Impact</h3>
         <table class="pr-table">
           <thead><tr><th>Rule ID</th><th>Entry</th><th>Trigger</th></tr></thead>
-          <tbody><tr><td class='pr-id'>PR-PAYOFF-01</td><td>Dr Cash/Nostro / Cr LoanReceivable + InterestReceivable (zeroing both)</td><td>payoff payment matching a valid, unexpired quote</td></tr></tbody>
+          <tbody><tr><td class='pr-id'>PR-PAYOFF-01</td><td>Dr Cash/Nostro / Cr LoanReceivable + InterestReceivable (zeroing both, via allocation)</td><td>payoff payment matching a valid, unexpired quote, processed through receiveRepaymentNotification</td></tr></tbody>
         </table>
         
 
       <h3>3. Spec Files (New / Modified)</h3>
       <table class="spec-table">
         <thead><tr><th>File</th><th>Purpose</th></tr></thead>
-        <tbody><tr><td class='code'>/specs/openapi/loan-account-subledger.yaml</td><td>add GET .../payoff-quote</td></tr><tr><td class='code'>/specs/openapi/gl-posting-engine.yaml</td><td>register PR-PAYOFF-01</td></tr><tr><td class='code'>/specs/asyncapi/loan-account-subledger-events.yaml</td><td>new channel loan.account.closed.v1</td></tr></tbody>
+        <tbody><tr><td class='code'>specs/openapi/loan-account-subledger.yaml</td><td>GET .../payoff-quote, GET /payoffs/{id}; receiveRepaymentNotification extended with the payoffQuoteId branch (no separate settlement endpoint)</td></tr><tr><td class='code'>specs/openapi/gl-posting-engine.yaml</td><td>register PR-PAYOFF-01</td></tr><tr><td class='code'>specs/asyncapi/loan-account-subledger-events.yaml</td><td>channel loan.account.closed (renamed from loan.account.closed.v1)</td></tr><tr><td class='code'>specs/asyncapi/batch-eod-events.yaml</td><td>channel payoff.exception.raised — added to match the shipped contract</td></tr></tbody>
       </table>
 
       <h3>4. Domain Events</h3>
       <table class="event-table">
         <thead><tr><th>Event</th><th>Producer</th><th>Consumer(s)</th></tr></thead>
-        <tbody><tr><td class='code'>LoanAccountClosed</td><td>LAS</td><td>CRM, BEOD</td></tr><tr><td class='code'>JournalEntryPosted (Payoff)</td><td>GL</td><td>LAS, BEOD</td></tr></tbody>
+        <tbody><tr><td class='code'>LoanAccountClosed (loan.account.closed)</td><td>AccountAdapter</td><td>CRMAdapter, BatchEodAdapter</td></tr><tr><td class='code'>JournalEntryPosted (gl.entry.posted, filtered PR-PAYOFF-01)</td><td>GLPostingAdapter</td><td>AccountAdapter, BatchEodAdapter</td></tr><tr><td class='code'>PayoffExceptionRaised (payoff.exception.raised)</td><td>BatchEodAdapter</td><td>Ops/Financial-Reporting (human)</td></tr></tbody>
       </table>
 
       <h3>5. Feature Flags</h3>
@@ -367,17 +373,17 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       </table>
 
       <h3>6. NFR &amp; Security Implications</h3>
-      <ul class="nfr-list"><li>Quote generation must be near-real-time (borrower/CSR-facing).</li><li>Quote itemization is retained and linked to the settling journal entry for dispute traceability.</li><li>Adds REQ-PAYOFF-009 to the BEOD daily job catalog.</li></ul>
+      <ul class="nfr-list"><li>Quote generation must be near-real-time (borrower/CSR-facing).</li><li>Quote itemization is retained and linked to the settling journal entry for dispute traceability.</li><li>Adds REQ-PAYOFF-009 to the BEOD daily job catalog.</li><li>There is no reversal endpoint for a Payoff in the shipped contract — a returned/NSF payoff payment is not yet a specified flow. Open question carried forward unresolved, same class as the analogous gap noted under CB-CHARGEOFF's recovery.</li></ul>
     </section>
     
     <section class="epic" id="CB-CHARGEOFF">
       <h2><span class="epic-num">7</span> Loan Charge-off &amp; Write-off <span class="epic-id">[CB-CHARGEOFF]</span></h2>
 
       <h3>1. Module Ownership</h3>
-      <p class="ownership">LAS owns the state machine and recovery orchestration; GL posts; CRM logs; BEOD reconciles the reserve account.</p>
+      <p class="ownership">LAS (AccountAPI) owns the state machine; recovery is routed through the unified receiveRepaymentNotification entry point (see Architecture Context); GL posts; CRM logs; BEOD reconciles the reserve account via a new portfolio-wide GL balance read.</p>
 
       <h3>2. Interaction Sequence</h3>
-      <ol class="sequence"><li>Collections system calls <code>LAS: POST /loan-accounts/{id}:chargeoff</code> with an approved decision reference — REQ-CHGOFF-001, status Pending Charge-off.</li><li>LAS → <code>GL: POST /journal-entries</code>, rule <strong>PR-CHGOFF-01</strong> (Dr AllowanceForLoanLosses (B+I) / Cr LoanReceivable B, InterestReceivable I) — REQ-CHGOFF-002, 004.</li><li>On confirmation, status → Charged-Off — REQ-CHGOFF-003. LAS publishes LoanAccountChargedOff → CRM (REQ-CHGOFF-007), and this flag is also read by <strong>CB-ACCR and CB-DELINQ's</strong> eligibility queries to exclude charged-off accounts — REQ-CHGOFF-005 (same cross-epic pattern as the Non-Accrual flag).</li><li>Recovery: PAY → PaymentReceived (reused) → LAS matches to the charged-off account → GL posts <strong>PR-CHGOFF-02</strong> (Dr Cash/Nostro / Cr RecoveryIncome) — REQ-CHGOFF-006; status remains Charged-Off — this is <strong>not</strong> a reversal of PR-CHGOFF-01.</li><li>BEOD sums PR-CHGOFF-01 postings against the AllowanceForLoanLosses control-account balance — REQ-CHGOFF-008.</li></ol>
+      <ol class="sequence"><li>Collections system calls <code>AccountAPI: POST /loan-accounts/{id}:chargeoff</code> (Idempotency-Key = chargeoffDecisionReference) — REQ-CHGOFF-001, status Pending Charge-off.</li><li>AccountAPI → <code>GLPostingAPI: POST /journal-entries</code>, rule <strong>PR-CHGOFF-01</strong> (Dr AllowanceForLoanLosses (B+I) / Cr LoanReceivable B, InterestReceivable I, via <code>allocation</code>), metadata mandatorily carrying chargeoffDecisionReference/confirmedBy — REQ-CHGOFF-002, 004.</li><li>On confirmation, status → Charged-Off — REQ-CHGOFF-003. AccountAPI publishes <code>LoanAccountChargedOff</code> on <code>loan.account.chargedoff</code> → CRM (REQ-CHGOFF-007); the ChargedOff status is also read directly, same-service, by <strong>CB-ACCR and CB-DELINQ's</strong> eligibility queries to exclude the account — REQ-CHGOFF-005 (same cross-epic pattern as the Non-Accrual flag).</li><li>Recovery: PaymentAPI receives the inbound payment and calls <code>AccountAPI: POST /repayments:notify</code> — same unified endpoint as CB-REPAY/CB-PAYOFF. Because the matched loan account is already ChargedOff, this branch is checked FIRST, ahead of the repayment/payoff branches, regardless of any payoffQuoteId present. Posts <strong>PR-CHGOFF-02</strong> (Dr Cash/Nostro / Cr RecoveryIncome) — REQ-CHGOFF-006; status remains Charged-Off — this is <strong>not</strong> a reversal of PR-CHGOFF-01.</li><li>BEOD → <code>GLPostingAPI: GET /gl-accounts/AllowanceForLoanLosses/balance</code> — a new, portfolio-wide GL capability distinct from per-loan-account runningBalanceAfter, added specifically because this reconciliation needed it — and compares against the running sum of PR-CHGOFF-01 postings (via gl.entry.posted), raising <code>chargeoff.exception.raised</code> on mismatch — REQ-CHGOFF-008.</li></ol>
 
       
         <h3>Posting-Rule Impact</h3>
@@ -390,13 +396,13 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       <h3>3. Spec Files (New / Modified)</h3>
       <table class="spec-table">
         <thead><tr><th>File</th><th>Purpose</th></tr></thead>
-        <tbody><tr><td class='code'>/specs/openapi/loan-account-subledger.yaml</td><td>add POST .../chargeoff</td></tr><tr><td class='code'>/specs/openapi/gl-posting-engine.yaml</td><td>register PR-CHGOFF-01, PR-CHGOFF-02</td></tr><tr><td class='code'>/specs/asyncapi/loan-account-subledger-events.yaml</td><td>new channel loan.account.chargedoff.v1</td></tr></tbody>
+        <tbody><tr><td class='code'>specs/openapi/loan-account-subledger.yaml</td><td>POST .../chargeoff, GET /chargeoffs/{id}, GET /recoveries/{id}; receiveRepaymentNotification extended with the ChargedOff-status branch</td></tr><tr><td class='code'>specs/openapi/gl-posting-engine.yaml</td><td>register PR-CHGOFF-01 (first rule debiting a non-Cash control account), PR-CHGOFF-02; NEW GET /gl-accounts/{code}/balance</td></tr><tr><td class='code'>specs/asyncapi/loan-account-subledger-events.yaml</td><td>channel loan.account.chargedoff (renamed from loan.account.chargedoff.v1)</td></tr><tr><td class='code'>specs/asyncapi/batch-eod-events.yaml</td><td>channel chargeoff.exception.raised — a fundamentally different aggregation pattern (portfolio-wide amount comparison, not per-date count comparison) than the other three exception channels</td></tr></tbody>
       </table>
 
       <h3>4. Domain Events</h3>
       <table class="event-table">
         <thead><tr><th>Event</th><th>Producer</th><th>Consumer(s)</th></tr></thead>
-        <tbody><tr><td class='code'>LoanAccountChargedOff</td><td>LAS</td><td>CRM, BEOD, LAS-internal (CB-ACCR &amp; CB-DELINQ exclusion logic)</td></tr><tr><td class='code'>JournalEntryPosted (ChargeOff/Recovery)</td><td>GL</td><td>LAS, BEOD</td></tr></tbody>
+        <tbody><tr><td class='code'>LoanAccountChargedOff (loan.account.chargedoff)</td><td>AccountAdapter</td><td>CRMAdapter, BatchEodAdapter</td></tr><tr><td class='code'>JournalEntryPosted (gl.entry.posted, filtered PR-CHGOFF-01/02)</td><td>GLPostingAdapter</td><td>AccountAdapter, BatchEodAdapter</td></tr><tr><td class='code'>ChargeoffExceptionRaised (chargeoff.exception.raised)</td><td>BatchEodAdapter</td><td>Ops/Financial-Reporting (human)</td></tr></tbody>
       </table>
 
       <h3>5. Feature Flags</h3>
@@ -411,17 +417,17 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       </table>
 
       <h3>6. NFR &amp; Security Implications</h3>
-      <ul class="nfr-list"><li>Not latency-sensitive (batch/manual-triggered process).</li><li>chargeoffReferenceId must retain a durable link to the upstream credit-policy approval artifact.</li><li>Reserve reconciliation aggregates across the entire portfolio against one GL control account — a different aggregation pattern than every other epic's per-account check; must be modeled distinctly in BEOD's job design.</li></ul>
+      <ul class="nfr-list"><li>Not latency-sensitive (batch/manual-triggered process).</li><li>chargeoffDecisionReference must retain a durable link to the upstream credit-policy approval artifact — retained verbatim on PR-CHGOFF-01's metadata, not just AccountAPI's own ChargeOff record.</li><li>Reserve reconciliation aggregates across the entire portfolio against one GL control account — a different aggregation pattern than every other epic's per-date, per-account check; this is why it needed a new GET /gl-accounts/{code}/balance capability rather than reusing gl.entry.posted alone.</li><li>No reversal endpoint exists for a Recovery — same class of open question as CB-PAYOFF's missing payoff-reversal flow.</li></ul>
     </section>
     
     <section class="epic" id="CB-MOD">
       <h2><span class="epic-num">8</span> Loan Modification (Rate/Term Change) <span class="epic-id">[CB-MOD]</span></h2>
 
       <h3>1. Module Ownership</h3>
-      <p class="ownership">LAS owns term-versioning and the conditional posting branch; GL posts only for balance-impacting modifications; CRM logs.</p>
+      <p class="ownership">LAS (AccountAPI) owns term-versioning and the conditional posting branch; GL posts only for balance-impacting modifications; CRM logs.</p>
 
       <h3>2. Interaction Sequence</h3>
-      <ol class="sequence"><li><code>LAS: POST /loan-accounts/{id}/modifications</code> (idempotent on modificationReferenceId) with new terms + effective date E — REQ-MOD-001, 005.</li><li>LAS appends immutable term version v_n+1 effective E; prior versions untouched — REQ-MOD-002.</li><li><strong>Branch A (capitalization):</strong> LAS → <code>GL: POST /journal-entries</code>, rule <strong>PR-MOD-01</strong> (Dr LoanReceivable X / Cr InterestReceivable and/or FeeReceivable X) — REQ-MOD-003.</li><li><strong>Branch B (rate/term only):</strong> no GL call is made — REQ-MOD-004; implemented as a true no-op, not a zero-amount journal entry (a zero-amount entry would still consume a sourceEventId and violate the “no false balance event” intent).</li><li>LAS publishes LoanTermsModified → CRM (REQ-MOD-007), and exposes <code>GET /loan-accounts/{id}/term-versions?asOf=D</code> — the read CB-ACCR must switch to for resolving “most recent version effective ≤ D” (REQ-MOD-006).</li><li><code>GET /loan-accounts/{id}/term-versions</code> (full, unfiltered) serves the audit requirement — REQ-MOD-008.</li></ol>
+      <ol class="sequence"><li><code>AccountAPI: POST /loan-accounts/{id}/modifications</code> (operationId <code>applyModification</code>, Idempotency-Key = modificationReferenceId) with new terms + effective date E — REQ-MOD-001, 005.</li><li>AccountAPI appends immutable term version v_n+1 effective E; prior versions untouched — REQ-MOD-002.</li><li><strong>Branch A (capitalization):</strong> AccountAPI → <code>GLPostingAPI: POST /journal-entries</code>, rule <strong>PR-MOD-01</strong> (Dr LoanReceivable X / Cr InterestReceivable and/or FeeReceivable X, via a new <code>capitalization</code> input shape — distinct from <code>allocation</code>, since principal is the debit here, not a third credit category) — REQ-MOD-003.</li><li><strong>Branch B (rate/term only):</strong> no GL call is made — REQ-MOD-004; implemented as a true no-op, not a zero-amount journal entry.</li><li>AccountAPI publishes <code>LoanTermsModified</code> on <code>loan.terms.modified</code> → CRM (REQ-MOD-007) — fires for BOTH branches, unlike this catalog's exception-queue events which fire for only one side of a decision.</li><li><code>GET /loan-accounts/{id}/term-versions</code> (full, unfiltered) serves the audit requirement — REQ-MOD-008. <strong>Split from the original single combined-endpoint design</strong> into two operations: this one for full history, and a second, <code>GET /loan-accounts/{id}/term-versions:effective?asOf=D</code>, for the single-version point-in-time resolution CB-ACCR's rate lookup performs internally (REQ-MOD-006).</li></ol>
 
       
         <h3>Posting-Rule Impact</h3>
@@ -434,13 +440,13 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       <h3>3. Spec Files (New / Modified)</h3>
       <table class="spec-table">
         <thead><tr><th>File</th><th>Purpose</th></tr></thead>
-        <tbody><tr><td class='code'>/specs/openapi/loan-account-subledger.yaml</td><td>add POST .../modifications, GET .../term-versions</td></tr><tr><td class='code'>/specs/openapi/gl-posting-engine.yaml</td><td>register PR-MOD-01</td></tr><tr><td class='code'>/specs/asyncapi/loan-account-subledger-events.yaml</td><td>new channel loan.terms.modified.v1</td></tr></tbody>
+        <tbody><tr><td class='code'>specs/openapi/loan-account-subledger.yaml</td><td>POST .../modifications, GET /modifications/{id}, GET .../term-versions, GET .../term-versions:effective (split into two operations vs. the original single-endpoint design)</td></tr><tr><td class='code'>specs/openapi/gl-posting-engine.yaml</td><td>register PR-MOD-01; NEW Capitalization schema/oneOf branch on PostJournalEntryRequest (3-way exclusive choice with amount/allocation)</td></tr><tr><td class='code'>specs/asyncapi/loan-account-subledger-events.yaml</td><td>channel loan.terms.modified (renamed from loan.terms.modified.v1)</td></tr></tbody>
       </table>
 
       <h3>4. Domain Events</h3>
       <table class="event-table">
         <thead><tr><th>Event</th><th>Producer</th><th>Consumer(s)</th></tr></thead>
-        <tbody><tr><td class='code'>LoanTermsModified</td><td>LAS</td><td>CRM, LAS-internal (CB-ACCR term-resolution)</td></tr><tr><td class='code'>JournalEntryPosted (Modification)</td><td>GL</td><td>LAS, BEOD — fires only for Branch A</td></tr></tbody>
+        <tbody><tr><td class='code'>LoanTermsModified (loan.terms.modified)</td><td>AccountAdapter</td><td>CRMAdapter</td></tr><tr><td class='code'>JournalEntryPosted (gl.entry.posted, filtered PR-MOD-01)</td><td>GLPostingAdapter</td><td>AccountAdapter, BatchEodAdapter — fires only for Branch A</td></tr></tbody>
       </table>
 
       <h3>5. Feature Flags</h3>
@@ -460,13 +466,13 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
       </table>
 
       <h3>6. NFR &amp; Security Implications</h3>
-      <ul class="nfr-list"><li>Not latency-sensitive.</li><li>Term-version history must be retained indefinitely with no purge/TTL — confirm explicitly against the generic operational-log retention policy, which may default shorter.</li><li>Breaking-change dependency: CB-MOD changes what CB-ACCR reads (a single static rate record → a versioned lookup); sequence delivery so CB-MOD's read API ships and is validated before CB-ACCR is cut over to consume it.</li></ul>
+      <ul class="nfr-list"><li>Not latency-sensitive.</li><li>Term-version history must be retained indefinitely with no purge/TTL — confirm explicitly against the generic operational-log retention policy, which may default shorter.</li><li>Breaking-change dependency: CB-MOD changes what CB-ACCR reads (a single static rate record → a versioned lookup); this dependency shipped correctly — CB-ACCR's runDailyAccrual description now explicitly references the effective-dated resolution.</li><li>[Bug caught during implementation] The first draft of Modification.capitalizedAmount combined a nullable outer type with allOf-referencing Money, which is a genuine schema contradiction (Money's own type:object constraint would reject null under allOf regardless of the outer type union). Fixed to oneOf[Money, null] and verified against real payloads — see specs/CHANGELOG.md.</li></ul>
     </section>
     
 
 <section class="section-intro" id="cross-epic">
 <h2>Appendix A — Cross-Epic Dependency Note</h2>
-<div class="cross-note">Three epics — CB-DELINQ (Non-Accrual flag), CB-CHARGEOFF (Charged-Off flag), and CB-MOD (term-version lookup) — all modify what CB-ACCR reads at daily-batch time. None of this is a scope problem, but the BEOD DAG and LAS's internal read contracts need explicit sequencing: CB-DELINQ and CB-CHARGEOFF's flag updates must run before CB-ACCR's eligibility query in the daily batch order, and CB-MOD's term-version read API must ship and be validated before CB-ACCR is cut over to consume it instead of a single static rate record. This is a build-order constraint for engineering, not a scope gap.</div>
+<div class="cross-note">Three epics — CB-DELINQ (Non-Accrual flag), CB-CHARGEOFF (Charged-Off status), and CB-MOD (term-version lookup) — all modify what CB-ACCR reads at daily-batch time, and all three resolve as same-service internal reads inside AccountAPI, not cross-service event subscriptions — CB-ACCR does not subscribe to loan.nonaccrual.flagged or loan.account.chargedoff to drive its own eligibility logic; those events exist for BatchEodAdapter visibility only. None of this is a scope problem, but the BEOD DAG needs explicit sequencing: CB-DELINQ and CB-CHARGEOFF's status updates must run before CB-ACCR's eligibility query in the daily batch order, and CB-MOD's term-version data must exist before CB-ACCR's rate resolution runs against it. This is a build-order constraint for engineering, not a scope gap — and it shipped correctly: runDailyAccrual's implemented description references all three dependencies explicitly.</div>
 </section>
 
 <section class="section-intro" id="pr-catalog">
@@ -474,7 +480,7 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
 <p class="small">Every journal entry this design introduces, across all 8 epics. GL is the only writer for all of these.</p>
 <table>
 <thead><tr><th>Rule ID</th><th>Epic</th><th>Entry</th><th>Trigger</th></tr></thead>
-<tbody><tr><td class='pr-id'>PR-DISB-01</td><td>CB-DISB</td><td>Dr LoanReceivable P / Cr Cash-Nostro P</td><td>confirmed disbursement request, post party validation</td></tr><tr><td class='pr-id'>PR-DISB-02</td><td>CB-DISB</td><td>reversal of PR-DISB-01</td><td>confirmed payment failure/return</td></tr><tr><td class='pr-id'>PR-ACCR-01</td><td>CB-ACCR</td><td>Dr InterestReceivable X / Cr InterestIncome X</td><td>daily eligible-account evaluation; idempotent on (loanAccountId, businessDate)</td></tr><tr><td class='pr-id'>PR-REPAY-01</td><td>CB-REPAY</td><td>Dr Cash/Nostro P / Cr FeeReceivable + InterestReceivable + LoanReceivable (per allocation)</td><td>matched, waterfall-allocated repayment — clears receivables built up by PR-ACCR-01/PR-DELINQ-01, never re-credits Income</td></tr><tr><td class='pr-id'>PR-REPAY-02</td><td>CB-REPAY</td><td>reversal of PR-REPAY-01</td><td>confirmed return (NSF) or misapplication</td></tr><tr><td class='pr-id'>PR-DELINQ-01</td><td>CB-DELINQ</td><td>Dr FeeReceivable / Cr FeeIncome</td><td>account past grace period on a missed installment</td></tr><tr><td class='pr-id'>PR-DELINQ-02</td><td>CB-DELINQ</td><td>reversal of PR-DELINQ-01</td><td>authorized fee waiver</td></tr><tr><td class='pr-id'>PR-PAYOFF-01</td><td>CB-PAYOFF</td><td>Dr Cash/Nostro / Cr LoanReceivable + InterestReceivable (zeroing both)</td><td>payoff payment matching a valid, unexpired quote</td></tr><tr><td class='pr-id'>PR-CHGOFF-01</td><td>CB-CHARGEOFF</td><td>Dr AllowanceForLoanLosses (B+I) / Cr LoanReceivable B, InterestReceivable I</td><td>confirmed, approved charge-off decision</td></tr><tr><td class='pr-id'>PR-CHGOFF-02</td><td>CB-CHARGEOFF</td><td>Dr Cash/Nostro / Cr RecoveryIncome</td><td>recovery payment on a charged-off account (distinct entry type, not a reversal)</td></tr><tr><td class='pr-id'>PR-MOD-01</td><td>CB-MOD</td><td>Dr LoanReceivable X / Cr InterestReceivable and/or FeeReceivable X</td><td>approved modification that capitalizes past-due interest/fees (conditional — Branch A only)</td></tr></tbody>
+<tbody><tr><td class='pr-id'>PR-DISB-01</td><td>CB-DISB</td><td>Dr LoanReceivable P / Cr Cash-Nostro P</td><td>confirmed disbursement request, post party validation</td></tr><tr><td class='pr-id'>PR-DISB-02</td><td>CB-DISB</td><td>reversal of PR-DISB-01</td><td>confirmed payment failure/return</td></tr><tr><td class='pr-id'>PR-ACCR-01</td><td>CB-ACCR</td><td>Dr InterestReceivable X / Cr InterestIncome X</td><td>daily eligible-account evaluation; idempotent on (loanAccountId, businessDate)</td></tr><tr><td class='pr-id'>PR-REPAY-01</td><td>CB-REPAY</td><td>Dr Cash/Nostro P / Cr FeeReceivable + InterestReceivable + LoanReceivable (per allocation)</td><td>matched, waterfall-allocated repayment — clears receivables built up by PR-ACCR-01/PR-DELINQ-01, never re-credits Income</td></tr><tr><td class='pr-id'>PR-REPAY-02</td><td>CB-REPAY</td><td>reversal of PR-REPAY-01</td><td>confirmed return (NSF) or misapplication</td></tr><tr><td class='pr-id'>PR-DELINQ-01</td><td>CB-DELINQ</td><td>Dr FeeReceivable / Cr FeeIncome</td><td>account past grace period on a missed installment</td></tr><tr><td class='pr-id'>PR-DELINQ-02</td><td>CB-DELINQ</td><td>reversal of PR-DELINQ-01</td><td>authorized fee waiver</td></tr><tr><td class='pr-id'>PR-PAYOFF-01</td><td>CB-PAYOFF</td><td>Dr Cash/Nostro / Cr LoanReceivable + InterestReceivable (zeroing both, via allocation)</td><td>payoff payment matching a valid, unexpired quote, processed through receiveRepaymentNotification</td></tr><tr><td class='pr-id'>PR-CHGOFF-01</td><td>CB-CHARGEOFF</td><td>Dr AllowanceForLoanLosses (B+I) / Cr LoanReceivable B, InterestReceivable I</td><td>confirmed, approved charge-off decision</td></tr><tr><td class='pr-id'>PR-CHGOFF-02</td><td>CB-CHARGEOFF</td><td>Dr Cash/Nostro / Cr RecoveryIncome</td><td>recovery payment on a charged-off account (distinct entry type, not a reversal)</td></tr><tr><td class='pr-id'>PR-MOD-01</td><td>CB-MOD</td><td>Dr LoanReceivable X / Cr InterestReceivable and/or FeeReceivable X</td><td>approved modification that capitalizes past-due interest/fees (conditional — Branch A only)</td></tr></tbody>
 </table>
 </section>
 
@@ -482,7 +488,7 @@ footer.pagefoot { margin-top: 40px; font-family: Helvetica, Arial, sans-serif; f
 <h2>Appendix C — Consolidated Domain Event Catalog</h2>
 <table>
 <thead><tr><th>Event</th><th>Epic</th><th>Producer</th><th>Consumer(s)</th></tr></thead>
-<tbody><tr><td class='code'>LoanAccountBooked</td><td>CB-BOOK</td><td>LAS</td><td>CRM, BEOD</td></tr><tr><td class='code'>JournalEntryPosted (Disbursement)</td><td>CB-DISB</td><td>GL</td><td>LAS, BEOD</td></tr><tr><td class='code'>PaymentExecuted / PaymentFailed</td><td>CB-DISB</td><td>PAY</td><td>LAS</td></tr><tr><td class='code'>LoanAccountDisbursed</td><td>CB-DISB</td><td>LAS</td><td>CRM, BEOD</td></tr><tr><td class='code'>JournalEntryPosted (Accrual)</td><td>CB-ACCR</td><td>GL</td><td>BEOD</td></tr><tr><td class='code'>AccrualExceptionRaised</td><td>CB-ACCR</td><td>BEOD</td><td>Ops/BEOD dashboard</td></tr><tr><td class='code'>PaymentReceived</td><td>CB-REPAY</td><td>PAY</td><td>LAS</td></tr><tr><td class='code'>PaymentUnmatched</td><td>CB-REPAY</td><td>LAS</td><td>BEOD</td></tr><tr><td class='code'>LoanRepaymentPosted</td><td>CB-REPAY</td><td>LAS</td><td>CRM</td></tr><tr><td class='code'>DelinquencyStatusChanged</td><td>CB-DELINQ</td><td>LAS</td><td>CRM</td></tr><tr><td class='code'>LoanAccountNonAccrualFlagged</td><td>CB-DELINQ</td><td>LAS</td><td>LAS-internal (Accrual eligibility, CB-ACCR), BEOD</td></tr><tr><td class='code'>LoanAccountClosed</td><td>CB-PAYOFF</td><td>LAS</td><td>CRM, BEOD</td></tr><tr><td class='code'>JournalEntryPosted (Payoff)</td><td>CB-PAYOFF</td><td>GL</td><td>LAS, BEOD</td></tr><tr><td class='code'>LoanAccountChargedOff</td><td>CB-CHARGEOFF</td><td>LAS</td><td>CRM, BEOD, LAS-internal (CB-ACCR &amp; CB-DELINQ exclusion logic)</td></tr><tr><td class='code'>JournalEntryPosted (ChargeOff/Recovery)</td><td>CB-CHARGEOFF</td><td>GL</td><td>LAS, BEOD</td></tr><tr><td class='code'>LoanTermsModified</td><td>CB-MOD</td><td>LAS</td><td>CRM, LAS-internal (CB-ACCR term-resolution)</td></tr><tr><td class='code'>JournalEntryPosted (Modification)</td><td>CB-MOD</td><td>GL</td><td>LAS, BEOD — fires only for Branch A</td></tr></tbody>
+<tbody><tr><td class='code'>LoanAccountBooked (loan.account.booked)</td><td>CB-BOOK</td><td>AccountAdapter</td><td>CRMAdapter, BatchEodAdapter</td></tr><tr><td class='code'>LoanBookingRejected (loan.booking.rejected)</td><td>CB-BOOK</td><td>AccountAdapter</td><td>BatchEodAdapter</td></tr><tr><td class='code'>JournalEntryPosted (gl.entry.posted, filtered PR-DISB-*)</td><td>CB-DISB</td><td>GLPostingAdapter</td><td>AccountAdapter, BatchEodAdapter</td></tr><tr><td class='code'>PaymentDisbursementConfirmed / PaymentDisbursementFailed</td><td>CB-DISB</td><td>PaymentAdapter</td><td>AccountAdapter</td></tr><tr><td class='code'>LoanAccountDisbursed</td><td>CB-DISB</td><td>AccountAdapter</td><td>CRMAdapter, BatchEodAdapter</td></tr><tr><td class='code'>JournalEntryPosted (gl.entry.posted, filtered PR-ACCR-01)</td><td>CB-ACCR</td><td>GLPostingAdapter</td><td>BatchEodAdapter</td></tr><tr><td class='code'>AccrualExceptionRaised (accrual.exception.raised)</td><td>CB-ACCR</td><td>BatchEodAdapter</td><td>Ops/Financial-Reporting (human, not a module — see x-consumers: [] in the AsyncAPI file)</td></tr><tr><td class='code'>PaymentInboundReceived (payment.inbound.received)</td><td>CB-REPAY</td><td>PaymentAdapter</td><td>BatchEodAdapter (observability only — no longer drives AccountAdapter processing)</td></tr><tr><td class='code'>PaymentMatchFailed (payment.match.failed)</td><td>CB-REPAY</td><td>AccountAdapter</td><td>BatchEodAdapter</td></tr><tr><td class='code'>LoanRepaymentPosted (loan.repayment.posted)</td><td>CB-REPAY</td><td>AccountAdapter</td><td>CRMAdapter</td></tr><tr><td class='code'>RepaymentExceptionRaised (repayment.exception.raised)</td><td>CB-REPAY</td><td>BatchEodAdapter</td><td>Ops/Financial-Reporting (human)</td></tr><tr><td class='code'>DelinquencyStatusChanged (delinquency.status.changed)</td><td>CB-DELINQ</td><td>AccountAdapter</td><td>CRMAdapter</td></tr><tr><td class='code'>LoanNonAccrualFlagged (loan.nonaccrual.flagged)</td><td>CB-DELINQ</td><td>AccountAdapter</td><td>BatchEodAdapter (visibility only — CB-ACCR reads the flag same-service, not via this event)</td></tr><tr><td class='code'>DelinquencyExceptionRaised (delinquency.exception.raised)</td><td>CB-DELINQ</td><td>BatchEodAdapter</td><td>Ops/Financial-Reporting (human)</td></tr><tr><td class='code'>LoanAccountClosed (loan.account.closed)</td><td>CB-PAYOFF</td><td>AccountAdapter</td><td>CRMAdapter, BatchEodAdapter</td></tr><tr><td class='code'>JournalEntryPosted (gl.entry.posted, filtered PR-PAYOFF-01)</td><td>CB-PAYOFF</td><td>GLPostingAdapter</td><td>AccountAdapter, BatchEodAdapter</td></tr><tr><td class='code'>PayoffExceptionRaised (payoff.exception.raised)</td><td>CB-PAYOFF</td><td>BatchEodAdapter</td><td>Ops/Financial-Reporting (human)</td></tr><tr><td class='code'>LoanAccountChargedOff (loan.account.chargedoff)</td><td>CB-CHARGEOFF</td><td>AccountAdapter</td><td>CRMAdapter, BatchEodAdapter</td></tr><tr><td class='code'>JournalEntryPosted (gl.entry.posted, filtered PR-CHGOFF-01/02)</td><td>CB-CHARGEOFF</td><td>GLPostingAdapter</td><td>AccountAdapter, BatchEodAdapter</td></tr><tr><td class='code'>ChargeoffExceptionRaised (chargeoff.exception.raised)</td><td>CB-CHARGEOFF</td><td>BatchEodAdapter</td><td>Ops/Financial-Reporting (human)</td></tr><tr><td class='code'>LoanTermsModified (loan.terms.modified)</td><td>CB-MOD</td><td>AccountAdapter</td><td>CRMAdapter</td></tr><tr><td class='code'>JournalEntryPosted (gl.entry.posted, filtered PR-MOD-01)</td><td>CB-MOD</td><td>GLPostingAdapter</td><td>AccountAdapter, BatchEodAdapter — fires only for Branch A</td></tr></tbody>
 </table>
 </section>
 
