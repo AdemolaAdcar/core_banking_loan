@@ -19,8 +19,16 @@ info:
     already generalizes over any rule's debit account, including PR-CHGOFF-01's
     AllowanceForLoanLosses (the first rule in the catalog whose debit side
     isn't Cash/Nostro or an Income-reversal — the schema's genericity is what
-    made that a zero-change addition).
-  x-epics: [CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF]
+    made that a zero-change addition). This increment additionally documents
+    CB-MOD's rule (PR-MOD-01) — again no payload change, for the same reason:
+    the shared JournalEntry schema's generic `lines` array already represents
+    a single-debit/multi-credit entry regardless of which of `amount`,
+    `allocation`, or `capitalization` produced it on the synchronous request
+    side. Note CB-MOD's Branch B (rate/term-only modification) publishes
+    NOTHING here — REQ-CB-MOD-004's no-op means no JournalEntry exists to
+    post an event about, consistent with how CB-BOOK also has zero
+    gl.entry.posted activity.
+  x-epics: [CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF, CB-MOD]
   x-req-ids:
     - REQ-CB-DISB-003
     - REQ-CB-DISB-006
@@ -37,6 +45,8 @@ info:
     - REQ-CB-CHARGEOFF-002
     - REQ-CB-CHARGEOFF-006
     - REQ-CB-CHARGEOFF-008
+    - REQ-CB-MOD-003
+    - REQ-CB-MOD-004
 
 defaultContentType: application/json
 
@@ -53,10 +63,11 @@ channels:
       which module or posting rule triggered it. For CB-DISB: consumed by
       AccountAPI (to advance disbursement state) and Batch/EOD (REQ-CB-DISB-006
       daily reconciliation feed). For CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF,
-      and CB-CHARGEOFF: consumed by Batch/EOD only — AccountAPI observes its
-      own postings synchronously within the same request (runDailyAccrual,
-      receiveRepaymentNotification, runDailyDelinquencyAssessment, waiveFee,
-      recordChargeOff), so it does not re-consume this event for those
+      CB-CHARGEOFF, and CB-MOD's Branch A: consumed by Batch/EOD only —
+      AccountAPI observes its own postings synchronously within the same
+      request (runDailyAccrual, receiveRepaymentNotification,
+      runDailyDelinquencyAssessment, waiveFee, recordChargeOff,
+      applyModification), so it does not re-consume this event for those
       postings; Batch/EOD is the only cross-module consumer for that set —
       for CB-CHARGEOFF specifically, filtered to postingRuleCode =
       PR-CHGOFF-01 to compute the running sum GET /gl-accounts/{code}/balance

@@ -10,8 +10,8 @@ info:
     `payment.unmatched.v1` → `payment.match.failed`, a better 3-segment fit;
     `loan.account.nonaccrual.v1` → `loan.nonaccrual.flagged`); every Money
     field now the shared {amount, currency} object. Also adds CB-PAYOFF's
-    `loan.account.closed` event, and — this increment — CB-CHARGEOFF's
-    `loan.account.chargedoff` event.
+    `loan.account.closed` event, CB-CHARGEOFF's `loan.account.chargedoff`
+    event, and — this increment — CB-MOD's `loan.terms.modified` event.
     Note the deliberate asymmetry between CB-DISB and CB-BOOK's rejection
     handling: CB-DISB's disbursement rejection (REQ-CB-DISB-002) is NOT
     modeled as an event — surfaced only synchronously as a 422, since the
@@ -20,13 +20,18 @@ info:
     because REQ-CB-BOOK-001 explicitly requires rejected bookings to be
     "rejected to an exception queue". `payment.match.failed` follows the same
     pattern, because REQ-CB-REPAY-001 uses the same explicit "exception queue"
-    language. `loan.account.chargedoff` follows the same non-exception pattern
-    as `loan.account.closed` — a correctly-functioning terminal-state
-    transition, not a failure mode. Recovery payments deliberately do NOT get
-    their own event here — REQ-CB-CHARGEOFF-007 requires CRM logging only for
-    the charge-off event itself, not each recovery; a recovery's only
-    published trace is the generic gl.entry.posted (filtered to PR-CHGOFF-02).
-  x-epics: [CB-BOOK, CB-DISB, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF]
+    language. `loan.account.chargedoff` and `loan.terms.modified` both follow
+    the same non-exception pattern as `loan.account.closed` — correctly-
+    functioning state transitions, not failure modes. Recovery payments
+    deliberately do NOT get their own event here — REQ-CB-CHARGEOFF-007
+    requires CRM logging only for the charge-off event itself, not each
+    recovery; a recovery's only published trace is the generic
+    gl.entry.posted (filtered to PR-CHGOFF-02). `loan.terms.modified` fires
+    for BOTH branches of applyModification (rate/term-only and
+    capitalization) — REQ-CB-MOD-007 requires CRM logging of "the
+    modification event," not just the balance-impacting one, unlike the
+    booking-rejection/payment-match-failed exception-queue asymmetry above.
+  x-epics: [CB-BOOK, CB-DISB, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF, CB-MOD]
   x-req-ids:
     - REQ-CB-BOOK-001
     - REQ-CB-BOOK-002
@@ -42,6 +47,7 @@ info:
     - REQ-CB-PAYOFF-009
     - REQ-CB-CHARGEOFF-005
     - REQ-CB-CHARGEOFF-007
+    - REQ-CB-MOD-007
 
 defaultContentType: application/json
 
@@ -179,6 +185,20 @@ channels:
       message:
         $ref: '#/components/messages/LoanAccountChargedOff'
 
+  loan.terms.modified:
+    description: >
+      REQ-CB-MOD-007. Published for both branches of applyModification —
+      rate/term-only and capitalization alike, unlike this file's
+      exception-queue events, which fire for only one side of their
+      respective decisions. Consumed by CRMAdapter for interaction-log
+      visibility only — no rate, term, or GL account detail.
+      x-consumers: [CRMAdapter]
+    publish:
+      operationId: publishLoanTermsModified
+      summary: A loan account's terms were modified
+      message:
+        $ref: '#/components/messages/LoanTermsModified'
+
 components:
   messages:
     LoanAccountBooked:
@@ -243,6 +263,13 @@ components:
       contentType: application/json
       payload:
         $ref: '#/components/schemas/LoanAccountChargedOffPayload'
+
+    LoanTermsModified:
+      name: LoanTermsModified
+      title: Loan Terms Modified
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/LoanTermsModifiedPayload'
 
   schemas:
     LoanAccountBookedPayload:
@@ -374,3 +401,16 @@ components:
         Deliberately contains no write-off amount, reserve, or GL account
         detail — CRMAdapter's subscription must never require reading a
         balance.
+
+    LoanTermsModifiedPayload:
+      type: object
+      required: [loanAccountId, modificationId, effectiveDate, modifiedAt]
+      properties:
+        loanAccountId: { type: string, format: uuid }
+        modificationId: { type: string }
+        effectiveDate: { type: string, format: date }
+        modifiedAt: { type: string, format: date-time }
+      description: >
+        Deliberately contains no rate, term, capitalized amount, or GL
+        account detail — CRMAdapter's subscription must never require term
+        or balance data.

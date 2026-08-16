@@ -1,5 +1,73 @@
 # Spec Changelog
 
+## CB-MOD — 2026-08-16
+
+Adds Loan Modification, the eighth and final BRD epic. Additive within the
+v0.3.0 retrofit conventions — no further breaking change to the files below.
+
+**`openapi/gl-posting-engine.yaml`**
+- Registers `PR-MOD-01`, used only when a modification capitalizes past-due
+  interest/fees into principal. Introduces a third `PostJournalEntryRequest`
+  input shape, `capitalization` (`{interestAmount, feeAmount}` — a single
+  `LoanReceivable` debit against up to two credits), alongside the existing
+  `amount` and `allocation`. Deliberately **not** a reuse of `Allocation`:
+  that schema's three categories describe a Cash-or-Allowance-debit entry's
+  credit split; here principal is the debit, not a third credit category, so
+  giving it its own shape keeps the semantics honest rather than forcing a
+  `principalAmount: 0` into a schema that implies principal participates in
+  the split. `oneOf` extended to a three-way exclusive choice and verified
+  with `jsonschema` (capitalization-only payloads valid; `amount` +
+  `capitalization` together, or neither, both correctly rejected).
+- Also fixed, while extending the `amount` field's description: `PR-CHGOFF-02`
+  was missing from the list of rules `amount` is required for — a
+  documentation gap from the CB-CHARGEOFF increment, not a schema defect.
+- Consistent with the income-recognition principle every rule in this
+  catalog follows, `PR-MOD-01` touches no Income account — it only
+  reclassifies where an already-recognized receivable balance lives.
+
+**`openapi/loan-account-subledger.yaml`**
+- New `POST /loan-accounts/{id}/modifications` (`applyModification`),
+  `GET /modifications/{id}`, `GET /loan-accounts/{id}/term-versions` (full
+  audit history, REQ-CB-MOD-008), `GET /loan-accounts/{id}/term-versions:effective`
+  (single-version resolution as of a date, REQ-CB-MOD-006).
+  `applyModification` is the first action-style operation whose GL posting
+  is conditional at the *request-shape* level: a rate/term-only modification
+  makes zero GLPostingAPI calls (REQ-CB-MOD-004), not a call with a zero
+  amount.
+- `runDailyAccrual`'s description now explicitly references the
+  effective-dated term-version resolution (REQ-CB-MOD-006) — a loan
+  modified mid-cycle must resolve rate/day-count/principal-basis against the
+  historically correct version, not always the current one.
+- **Bug caught and fixed during this pass**: the first draft of `Modification.capitalizedAmount`
+  combined `type: ["object", "null"]` with `allOf: [$ref Money]` — a genuine
+  schema contradiction, since Money's own definition requires `type: object`,
+  which `allOf` would have enforced even when the outer type permitted
+  `null`, making a `null` value fail validation despite being declared
+  allowed. Fixed to `oneOf: [$ref Money, {type: "null"}]` and verified with
+  `jsonschema`: a real Money object validates, `null` validates, a bare
+  number correctly fails.
+
+**`asyncapi/loan-account-subledger-events.yaml`**
+- New `loan.terms.modified` (LAS → CRMAdapter). Unlike this file's
+  exception-queue events (which fire for only one side of a decision),
+  `loan.terms.modified` fires for **both** branches of `applyModification` —
+  REQ-CB-MOD-007 requires CRM logging of "the modification event" without
+  the capitalization/rate-only distinction the exception-queue asymmetry
+  elsewhere in this file depends on.
+
+**`asyncapi/gl-posting-engine-events.yaml`**
+- Documentation-only update — the shared `JournalEntry` schema already
+  generalizes over `PR-MOD-01`'s shape; Branch B publishes nothing here at
+  all, consistent with how CB-BOOK also has zero `gl.entry.posted` activity.
+
+All OpenAPI files re-validated with `openapi-spec-validator`; the three-way
+`oneOf` and the `capitalizedAmount` nullable-Money fix both verified against
+real payloads with `jsonschema`; all AsyncAPI files structurally checked
+with full `$ref` resolution.
+
+This completes OpenAPI/AsyncAPI coverage for all 8 BRD epics (CB-BOOK,
+CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF, CB-MOD).
+
 ## CB-CHARGEOFF — 2026-08-16
 
 Adds Loan Charge-off & Write-off on top of the v0.3.0 retrofit conventions

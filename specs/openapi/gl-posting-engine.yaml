@@ -48,8 +48,27 @@ info:
     account's current balance — needed because REQ-CB-CHARGEOFF-008's reserve
     reconciliation compares AllowanceForLoanLosses' aggregate balance against
     the sum of all PR-CHGOFF-01 postings, not a per-account figure.
+    This increment registers CB-MOD's single rule, PR-MOD-01 (capitalization),
+    used only when a modification rolls past-due interest/fees into principal
+    — a rate/term-only modification posts nothing at all (REQ-CB-MOD-004,
+    enforced entirely on AccountAPI's side; GL is simply never called for that
+    case, not called with a zero amount). PR-MOD-01 introduces a third input
+    shape, `capitalization`, alongside `amount` and `allocation`: a single
+    debit (LoanReceivable, for the combined total) against up to two credits
+    (InterestReceivable and/or FeeReceivable) — the mirror image of
+    PR-CHGOFF-01's shape (there, one debit against up to three credits via
+    `allocation`; here, one debit against up to two credits, but the specific
+    pairing (interest+fee crediting a single principal debit) doesn't match
+    `allocation`'s three-category meaning, which is why it gets its own
+    shape rather than reusing `allocation` with principalAmount forced to 0).
+    Consistent with the income-recognition principle throughout this catalog,
+    PR-MOD-01 touches no Income account at all — it only reclassifies where
+    an already-recognized receivable balance lives (from
+    InterestReceivable/FeeReceivable to LoanReceivable), the same "clear a
+    receivable, never re-touch Income" discipline PR-REPAY-01/PR-PAYOFF-01/
+    PR-CHGOFF-01 already follow.
   x-adapter: GLPostingAdapter
-  x-epics: [CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF]
+  x-epics: [CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF, CB-MOD]
   x-req-ids:
     - REQ-CB-DISB-003
     - REQ-CB-DISB-007
@@ -69,6 +88,9 @@ info:
     - REQ-CB-CHARGEOFF-004
     - REQ-CB-CHARGEOFF-006
     - REQ-CB-CHARGEOFF-008
+    - REQ-CB-MOD-003
+    - REQ-CB-MOD-004
+    - REQ-CB-MOD-005
 
 servers:
   - url: https://gl.internal.core-banking.example/v1
@@ -189,6 +211,14 @@ paths:
                   postingRuleCode: PR-CHGOFF-02
                   loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
                   amount: { amount: 15000, currency: USD }
+              modificationCapitalization:
+                summary: "PR-MOD-01 — capitalize past-due interest/fees into principal; touches no Income account (Idempotency-Key: mod:c4d5e6f7-3333-4a5b-9c8d-4a5b6c7d8e9f)"
+                value:
+                  postingRuleCode: PR-MOD-01
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  capitalization:
+                    interestAmount: { amount: 8420, currency: USD }
+                    feeAmount: { amount: 5000, currency: USD }
       responses:
         '201':
           description: New entry posted
@@ -210,8 +240,10 @@ paths:
             metadata.chargeoffDecisionReference/confirmedBy); wrong input shape
             for the rule (PR-DISB-*/PR-ACCR-01/PR-DELINQ-*/PR-CHGOFF-02 require
             `amount`, PR-REPAY-*/PR-PAYOFF-01/PR-CHGOFF-01 require
-            `allocation`); an allocation whose three categories are all 0; or a
-            Money field with a non-integer amount or non-ISO-4217 currency.
+            `allocation`, PR-MOD-01 requires `capitalization`); an allocation
+            whose three categories are all 0, or a capitalization whose two
+            categories are both 0; or a Money field with a non-integer amount
+            or non-ISO-4217 currency.
           content:
             application/json:
               schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
@@ -434,23 +466,49 @@ components:
         interestAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
         principalAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
 
+    Capitalization:
+      type: object
+      required: [interestAmount, feeAmount]
+      description: >
+        Categorized breakdown for PR-MOD-01 only: how much of a modification's
+        capitalized total is reclassified interest vs. fee — both were already
+        recognized as Income once, at accrual/assessment time; capitalizing
+        them only moves where the corresponding receivable balance lives (into
+        LoanReceivable), it does not touch Income. Distinct from `Allocation`:
+        Allocation describes a Cash-or-Allowance-debit entry's credit split
+        across fee+interest+principal; Capitalization describes a
+        LoanReceivable-debit entry's credit split across interest+fee only —
+        principal is the debit here, not a third credit category, so it does
+        not belong in this shape. Both keys always present (use amount: 0 for
+        a category not capitalized); GL omits the corresponding credit line
+        entirely for any category that is exactly 0. At least one category
+        must be greater than 0 — enforced server-side (400).
+      properties:
+        interestAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        feeAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+
     PostJournalEntryRequest:
       type: object
       required: [postingRuleCode, loanAccountId]
       description: >
-        Exactly one of `amount` or `allocation` must be present — never both,
-        never neither. `amount` serves single-credit-line rules (PR-DISB-*,
-        PR-ACCR-01, PR-DELINQ-*). `allocation` serves rules whose credit (or,
-        for a reversal, debit) side splits across multiple GL accounts by
-        business category — PR-REPAY-01/02 and PR-PAYOFF-01, whose split is the
-        outcome of AccountAPI's waterfall/payoff computation and cannot be
-        reduced to one number without losing the categorization GL needs to
-        pick the right accounts. This is a categorized business breakdown, not
-        raw ledger lines — callers still never specify a GL account code or
-        DEBIT/CREDIT direction directly.
+        Exactly one of `amount`, `allocation`, or `capitalization` must be
+        present — never more than one, never none. `amount` serves
+        single-credit-line rules (PR-DISB-*, PR-ACCR-01, PR-DELINQ-*).
+        `allocation` serves rules whose credit (or, for a reversal, debit)
+        side splits across multiple GL accounts by business category —
+        PR-REPAY-01/02, PR-PAYOFF-01, and PR-CHGOFF-01, whose split is the
+        outcome of AccountAPI's waterfall/payoff/write-off computation and
+        cannot be reduced to one number without losing the categorization GL
+        needs to pick the right accounts. `capitalization` serves PR-MOD-01
+        only — a single debit (LoanReceivable) against up to two credits
+        (InterestReceivable/FeeReceivable), a shape `allocation` doesn't fit
+        (see Capitalization's own description for why). All three are
+        categorized business breakdowns, not raw ledger lines — callers still
+        never specify a GL account code or DEBIT/CREDIT direction directly.
       oneOf:
         - required: [amount]
         - required: [allocation]
+        - required: [capitalization]
       properties:
         postingRuleCode:
           $ref: '#/components/schemas/PostingRuleCode'
@@ -460,9 +518,11 @@ components:
         amount:
           allOf:
             - $ref: '../schemas/money.schema.json#/$defs/Money'
-          description: Required for PR-DISB-01, PR-DISB-02, PR-ACCR-01, PR-DELINQ-01, PR-DELINQ-02. Mutually exclusive with `allocation`.
+          description: Required for PR-DISB-01, PR-DISB-02, PR-ACCR-01, PR-DELINQ-01, PR-DELINQ-02, PR-CHGOFF-02. Mutually exclusive with `allocation`/`capitalization`.
         allocation:
           $ref: '#/components/schemas/Allocation'
+        capitalization:
+          $ref: '#/components/schemas/Capitalization'
         reversalOfSourceEventId:
           type: string
           description: Required when postingRuleCode = PR-DISB-02, PR-REPAY-02, or PR-DELINQ-02; must reference an already-posted sourceEventId (the target entry's original Idempotency-Key value).
@@ -502,3 +562,4 @@ components:
         - PR-PAYOFF-01
         - PR-CHGOFF-01
         - PR-CHGOFF-02
+        - PR-MOD-01

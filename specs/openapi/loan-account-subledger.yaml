@@ -40,10 +40,22 @@ info:
     payment matched to a loan account already in "ChargedOff" status is always
     a recovery, regardless of whether payoffQuoteId is present — a charged-off
     account can never re-enter the ordinary repayment or payoff paths.
+    (6) CB-MOD (Loan Modification) added in this increment: applyModification
+    is the fourth new action-style operation, and the first whose GL posting
+    is conditional at the request-shape level rather than the response-status
+    level — a rate/term-only modification (Branch B, REQ-CB-MOD-004) makes
+    zero calls to GLPostingAPI, full stop, not a call with a zero amount. Also
+    adds GET /loan-accounts/{id}/term-versions (full audit history,
+    REQ-CB-MOD-008) and GET /loan-accounts/{id}/term-versions:effective
+    (single version resolution as of a date, REQ-CB-MOD-006) — the latter is
+    what runDailyAccrual's rate/day-count/principal-basis resolution now
+    references explicitly, since a loan with a modification whose effective
+    date falls mid-accrual-cycle must resolve against the correct historical
+    version, not always the current one.
   contact:
     name: Loan Account Subledger team
   x-adapter: AccountAdapter
-  x-epics: [CB-BOOK, CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF]
+  x-epics: [CB-BOOK, CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF, CB-CHARGEOFF, CB-MOD]
   x-req-ids:
     - REQ-CB-BOOK-001
     - REQ-CB-BOOK-002
@@ -97,6 +109,14 @@ info:
     - REQ-CB-CHARGEOFF-006
     - REQ-CB-CHARGEOFF-007
     - REQ-CB-CHARGEOFF-008
+    - REQ-CB-MOD-001
+    - REQ-CB-MOD-002
+    - REQ-CB-MOD-003
+    - REQ-CB-MOD-004
+    - REQ-CB-MOD-005
+    - REQ-CB-MOD-006
+    - REQ-CB-MOD-007
+    - REQ-CB-MOD-008
 
 servers:
   - url: https://las.internal.core-banking.example/v1
@@ -437,6 +457,191 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /loan-accounts/{loanAccountId}/modifications:
+    post:
+      operationId: applyModification
+      summary: Apply an approved modification to an active loan account
+      description: >
+        REQ-CB-MOD-001, 002, 003, 004, 005. Ingests an already-approved
+        modification decision — the approval itself is out of scope for this
+        endpoint. Always appends a new immutable TermVersion effective
+        `effectiveDate`; never edits a prior version (REQ-CB-MOD-002). Branches
+        on whether `capitalization` is present:
+        (a) present → Branch A. Posts PR-MOD-01 via GLPostingAPI for the
+        combined interest+fee total, increasing the new TermVersion's
+        principalAmount by that same total (REQ-CB-MOD-003).
+        (b) absent → Branch B. No GLPostingAPI call at all — a true no-op, not
+        a zero-amount posting (REQ-CB-MOD-004). Only rate/termMonths change,
+        principalAmount carries forward unchanged from the prior version.
+        Idempotent on the Idempotency-Key header (value =
+        modificationReferenceId): a retried call returns the original
+        Modification resource rather than appending a second TermVersion.
+      tags: [Modification]
+      parameters:
+        - $ref: '#/components/parameters/LoanAccountId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplyModificationRequest'
+            examples:
+              rateChangeOnly:
+                summary: "Branch B — Idempotency-Key = c4d5e6f7-3333-4a5b-9c8d-4a5b6c7d8e9f"
+                value:
+                  effectiveDate: "2026-09-01"
+                  confirmedBy: "ops.analyst.mramirez"
+                  newAnnualInterestRateBps: 1299
+              capitalization:
+                summary: "Branch A — Idempotency-Key = d5e6f7a8-4444-4a5b-9c8d-5b6c7d8e9f0a"
+                value:
+                  effectiveDate: "2026-09-01"
+                  confirmedBy: "ops.analyst.mramirez"
+                  capitalization:
+                    interestAmount: { amount: 8420, currency: USD }
+                    feeAmount: { amount: 5000, currency: USD }
+      responses:
+        '201':
+          description: Modification applied; new TermVersion appended (and, for Branch A, write-in-progress toward confirmed posting)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Modification'
+        '200':
+          description: Idempotent replay — original modification resource returned unchanged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Modification'
+        '400':
+          description: Neither newAnnualInterestRateBps, newTermMonths, nor capitalization present — a modification must change something
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Loan account is not in a modifiable status (e.g. not yet Disbursed, or Closed/ChargedOff), OR the Idempotency-Key was reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /modifications/{modificationId}:
+    get:
+      operationId: getModification
+      summary: Retrieve the current state of a modification
+      description: >
+        REQ-CB-MOD-001 through 005. Polling fallback for clients not
+        consuming loan.terms.modified. `modificationId` is always the
+        modificationReferenceId used as the Idempotency-Key on
+        applyModification — no separate ID space.
+      tags: [Modification]
+      parameters:
+        - name: modificationId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current modification state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Modification'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /loan-accounts/{loanAccountId}/term-versions:
+    get:
+      operationId: listTermVersions
+      summary: Retrieve the full, unfiltered term-version history of a loan account
+      description: >
+        REQ-CB-MOD-008. Every version ever appended (booking's v1 plus every
+        modification since), each with its effectiveDate and the specific
+        terms it carried — the audit/dispute-resolution surface. Never
+        filtered, never paginated by default; this is the complete history.
+      tags: [Modification]
+      parameters:
+        - $ref: '#/components/parameters/LoanAccountId'
+      responses:
+        '200':
+          description: Full term-version history, ordered by version ascending
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '../schemas/loan-account.schema.json#/$defs/TermVersion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /loan-accounts/{loanAccountId}/term-versions:effective:
+    get:
+      operationId: getEffectiveTermVersion
+      summary: Resolve the single term version in effect as of a given date
+      description: >
+        REQ-CB-MOD-006. The most recent TermVersion whose effectiveDate is on
+        or before `asOf` — never a version that takes effect after `asOf`.
+        This is the resolution runDailyAccrual performs internally
+        (same-service, not by calling this endpoint) for every account whose
+        term history includes a modification; exposed here as its own
+        operation for external callers (Ops tooling, payoff-quote generation,
+        audits) that need the same deterministic lookup without reaching into
+        AccountAPI's internal state.
+      tags: [Modification]
+      parameters:
+        - $ref: '#/components/parameters/LoanAccountId'
+        - name: asOf
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: The single term version in effect as of asOf
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/loan-account.schema.json#/$defs/TermVersion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Loan account not found, or asOf is before the account's booking date (no version exists yet)
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /loan-accounts:accrual-eligible:
     get:
       operationId: listAccrualEligibleAccounts
@@ -506,10 +711,14 @@ paths:
       operationId: runDailyAccrual
       summary: Execute the daily interest accrual batch for a business date
       description: >
-        REQ-CB-ACCR-001 through 007. For every account eligible as of `asOf`
-        (same eligibility rule as GET /loan-accounts:accrual-eligible), computes
-        the day's interest from the term version in effect and posts PR-ACCR-01
-        via GLPostingAPI, using an Idempotency-Key of the form
+        REQ-CB-ACCR-001 through 007; REQ-CB-MOD-006. For every account
+        eligible as of `asOf` (same eligibility rule as
+        GET /loan-accounts:accrual-eligible), resolves rate/day-count/
+        principal-basis from the term version effective as of `asOf` — the
+        same resolution GET /loan-accounts/{id}/term-versions:effective
+        exposes externally, computed here as a same-service internal lookup
+        rather than a round-trip — then computes the day's interest and posts
+        PR-ACCR-01 via GLPostingAPI, using an Idempotency-Key of the form
         `accr:{loanAccountId}:{asOf}` for each individual posting — GLPostingAPI's
         own idempotency on that key is what makes a partially-failed run safe to
         retry (REQ-CB-ACCR-003). This endpoint itself takes NO Idempotency-Key
@@ -1152,6 +1361,8 @@ components:
             loan-subledger:payoff:read: Generate payoff quotes and read payoff status
             loan-subledger:chargeoff:write: Record charge-off decisions
             loan-subledger:chargeoff:read: Read charge-off and recovery status
+            loan-subledger:modification:write: Apply loan modifications
+            loan-subledger:modification:read: Read modification and term-version history
 
   responses:
     BadRequest:
@@ -1181,6 +1392,77 @@ components:
           schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
 
   schemas:
+    Capitalization:
+      type: object
+      required: [interestAmount, feeAmount]
+      description: >
+        Same shape and meaning as GLPostingAPI's Capitalization schema —
+        duplicated rather than shared across service boundaries, consistent
+        with how Allocation is already duplicated (Capitalization was not in
+        the API/Event Spec Agent's named shared-object list either).
+      properties:
+        interestAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        feeAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+
+    ApplyModificationRequest:
+      type: object
+      required: [effectiveDate, confirmedBy]
+      description: >
+        At least one of newAnnualInterestRateBps, newTermMonths, or
+        capitalization must be present — a modification must change
+        something. termMonths and rate are independently optional (a
+        modification can change either, both, or neither if it's a
+        capitalization-only event); dayCountConvention is not modifiable
+        through this endpoint — it is fixed at booking.
+      properties:
+        effectiveDate:
+          type: string
+          format: date
+        confirmedBy:
+          type: string
+        newAnnualInterestRateBps:
+          type: integer
+          exclusiveMinimum: 0
+          description: Omit if the rate is unchanged.
+        newTermMonths:
+          type: integer
+          exclusiveMinimum: 0
+          description: Omit if the remaining term is unchanged.
+        capitalization:
+          $ref: '#/components/schemas/Capitalization'
+
+    Modification:
+      type: object
+      required: [modificationId, loanAccountId, effectiveDate, previousTermVersion, newTermVersion, confirmedBy, updatedAt]
+      properties:
+        modificationId:
+          type: string
+          description: Equal to the Idempotency-Key header value used on applyModification (REQ-CB-MOD-005)
+        loanAccountId:
+          type: string
+          format: uuid
+        effectiveDate:
+          type: string
+          format: date
+        previousTermVersion:
+          type: integer
+        newTermVersion:
+          type: integer
+        capitalizedAmount:
+          oneOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
+            - type: "null"
+          description: Total capitalized (interest + fee combined). Null/absent for a Branch B (rate/term-only) modification.
+        journalEntryId:
+          type: ["string", "null"]
+          format: uuid
+          description: Set only for Branch A, once PR-MOD-01 is confirmed posted. Always null for Branch B — REQ-CB-MOD-004's no-op means there is nothing to reference.
+        confirmedBy:
+          type: string
+        updatedAt:
+          type: string
+          format: date-time
+
     RecordChargeOffRequest:
       type: object
       required: [chargeoffDecisionReference, confirmedBy]
