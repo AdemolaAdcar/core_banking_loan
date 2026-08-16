@@ -1,12 +1,29 @@
 asyncapi: 2.6.0
 info:
   title: Payment Execution Events
-  version: 0.2.0
+  version: 0.3.0
   description: >
-    Domain events published by Payment Execution. Cumulative across change sets:
-    CB-DISB's two outcome channels (disbursement executed/failed) and CB-REPAY's
-    inbound channel (a payment arriving from an external rail, not yet matched to
-    any loan account — matching is the Loan Account Subledger's job, not PAY's).
+    Domain events published by PaymentAdapter. Retrofitted to the API/Event
+    Spec Agent's conventions (v0.3.0, BREAKING from v0.2.0): topics renamed to
+    the "<context>.<entity>.<eventPastTense>" convention with no version
+    suffix — `payment.executed.v1` → `payment.disbursement.confirmed` (the
+    literal example given in the role's own rules) and `payment.failed.v1` →
+    `payment.disbursement.failed`; `payment.received.v1` →
+    `payment.inbound.received`. The two disbursement-outcome events now use
+    the shared PaymentInstruction object (../schemas/payment-instruction.schema.json)
+    as their payload — status alone (Executed/Failed) distinguishes them,
+    since both are just PaymentInstruction state changes. `payment.inbound.received`
+    keeps its own lightweight payload rather than forcing PaymentInstruction's
+    shape: at receipt time PayAdapter cannot yet populate `purpose`
+    (REPAYMENT vs PAYOFF is AccountAdapter's determination, made inside
+    receiveRepaymentNotification, not something PayAdapter knows).
+    Also newly documented: `payment.inbound.received` is no longer the
+    authoritative trigger for repayment/payoff processing — AccountAPI's
+    receiveRepaymentNotification (a synchronous, Idempotency-Key-bearing
+    call PayAdapter makes directly) is now that trigger. This event still
+    publishes, for other consumers and for audit trail, but a consumer
+    relying on it to *drive* processing would be redundant with the
+    synchronous path and is no longer the intended integration pattern.
   x-epics: [CB-DISB, CB-REPAY]
   x-req-ids:
     - REQ-CB-DISB-004
@@ -22,133 +39,86 @@ servers:
     description: Core Banking domain event backbone
 
 channels:
-  payment.received.v1:
+  payment.inbound.received:
     description: >
-      REQ-CB-REPAY-001. Published whenever PAY receives an inbound payment from an
-      external rail (ACH, wire, etc.) that is NOT tied to a PAY-initiated
-      disbursement — i.e. money arriving, not money PAY sent out. PAY does no
-      matching of its own here; it normalizes the rail's payload and publishes
-      whatever loan-account reference the payer supplied (which may be absent or
-      malformed). The Loan Account Subledger is the sole consumer and owns all
-      matching logic (REQ-CB-REPAY-001) against that reference.
-      x-consumers: [LAS]
+      REQ-CB-REPAY-001. Published whenever PaymentAdapter receives an inbound
+      payment from an external rail that is NOT tied to a PayAdapter-initiated
+      disbursement. Published for observability/audit only — AccountAdapter
+      does not subscribe to this to trigger processing; it processes the same
+      payment synchronously via receiveRepaymentNotification instead.
+      x-consumers: [BatchEodAdapter]
     publish:
-      operationId: publishPaymentReceived
+      operationId: publishPaymentInboundReceived
       summary: An inbound payment has been received from a payment rail
       message:
-        $ref: '#/components/messages/PaymentReceived'
+        $ref: '#/components/messages/PaymentInboundReceived'
 
-  payment.executed.v1:
+  payment.disbursement.confirmed:
     description: >
-      Published once a submitted disbursement payment is confirmed executed by
-      the payment rail. Consumed by the Loan Account Subledger, which transitions
-      the disbursement to "Disbursed" and publishes LoanAccountDisbursed
-      (REQ-CB-DISB-004).
-      x-consumers: [LAS]
+      Published once a submitted disbursement PaymentInstruction is confirmed
+      executed by the rail (status = Executed). Consumed by AccountAdapter,
+      which transitions the disbursement to "Disbursed" and publishes
+      loan.account.disbursed (REQ-CB-DISB-004).
+      x-consumers: [AccountAdapter]
     publish:
-      operationId: publishPaymentExecuted
+      operationId: publishPaymentDisbursementConfirmed
       summary: A disbursement payment executed successfully
       message:
-        $ref: '#/components/messages/PaymentExecuted'
+        $ref: '#/components/messages/PaymentDisbursementConfirmed'
 
-  payment.failed.v1:
+  payment.disbursement.failed:
     description: >
-      Published when a submitted disbursement payment fails or is returned by the
-      rail. Consumed by the Loan Account Subledger, which triggers the
-      PR-DISB-02 reversal path (REQ-CB-DISB-007).
-      x-consumers: [LAS]
+      Published when a submitted disbursement PaymentInstruction fails or is
+      returned by the rail (status = Failed or Returned). Consumed by
+      AccountAdapter, which triggers the PR-DISB-02 reversal path (REQ-CB-DISB-007).
+      x-consumers: [AccountAdapter]
     publish:
-      operationId: publishPaymentFailed
+      operationId: publishPaymentDisbursementFailed
       summary: A disbursement payment failed or was returned
       message:
-        $ref: '#/components/messages/PaymentFailed'
+        $ref: '#/components/messages/PaymentDisbursementFailed'
 
 components:
   messages:
-    PaymentReceived:
-      name: PaymentReceived
-      title: Payment Received
+    PaymentInboundReceived:
+      name: PaymentInboundReceived
+      title: Payment Inbound Received
       contentType: application/json
       payload:
-        $ref: '#/components/schemas/PaymentReceivedPayload'
+        $ref: '#/components/schemas/PaymentInboundReceivedPayload'
 
-    PaymentExecuted:
-      name: PaymentExecuted
-      title: Payment Executed
+    PaymentDisbursementConfirmed:
+      name: PaymentDisbursementConfirmed
+      title: Payment Disbursement Confirmed
       contentType: application/json
       payload:
-        $ref: '#/components/schemas/PaymentExecutedPayload'
+        $ref: '../schemas/payment-instruction.schema.json#/$defs/PaymentInstruction'
 
-    PaymentFailed:
-      name: PaymentFailed
-      title: Payment Failed
+    PaymentDisbursementFailed:
+      name: PaymentDisbursementFailed
+      title: Payment Disbursement Failed
       contentType: application/json
       payload:
-        $ref: '#/components/schemas/PaymentFailedPayload'
+        $ref: '../schemas/payment-instruction.schema.json#/$defs/PaymentInstruction'
 
   schemas:
-    PaymentReceivedPayload:
+    PaymentInboundReceivedPayload:
       type: object
-      required: [paymentReferenceId, amount, currency, rail, receivedAt]
+      required: [paymentReferenceId, amount, rail, receivedAt]
       properties:
         paymentReferenceId:
           type: string
-          description: >
-            Rail-supplied reference, used downstream as the idempotency key for
-            the resulting Repayment/journal entry (REQ-CB-REPAY-004). Not
-            necessarily a UUID — format depends on the originating rail.
+          description: Same value used as the Idempotency-Key on the corresponding receiveRepaymentNotification call.
         loanAccountRef:
           type: ["string", "null"]
-          description: >
-            Whatever loan-account reference the payer supplied (e.g. an ACH
-            addenda field or check memo), verbatim and unvalidated. Null when the
-            rail provided none. LAS resolves this to an internal loanAccountId;
-            null or unresolvable values are exactly what drives REQ-CB-REPAY-001's
-            PaymentUnmatched path.
         amount:
-          type: number
-          exclusiveMinimum: 0
-        currency:
-          type: string
-          pattern: "^[A-Z]{3}$"
+          $ref: '../schemas/money.schema.json#/$defs/Money'
         rail:
           type: string
         receivedAt:
           type: string
           format: date-time
       description: >
-        Deliberately carries reference IDs and rail metadata only — no payer bank
-        account or routing details, which stay inside PAY's own store.
-
-    PaymentExecutedPayload:
-      type: object
-      required: [paymentId, disbursementId, executedAt]
-      properties:
-        paymentId:
-          type: string
-          format: uuid
-        disbursementId:
-          type: string
-          format: uuid
-        rail:
-          type: string
-        executedAt:
-          type: string
-          format: date-time
-
-    PaymentFailedPayload:
-      type: object
-      required: [paymentId, disbursementId, failureReason, failedAt]
-      properties:
-        paymentId:
-          type: string
-          format: uuid
-        disbursementId:
-          type: string
-          format: uuid
-        failureReason:
-          type: string
-          enum: [PAYMENT_RETURNED, PAYMENT_FAILED, RAIL_REJECTED]
-        failedAt:
-          type: string
-          format: date-time
+        Deliberately carries reference IDs and rail metadata only — no payer
+        bank account or routing details, which stay inside PaymentAdapter's
+        own store.

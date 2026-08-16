@@ -1,26 +1,41 @@
 openapi: 3.1.0
 info:
   title: Loan Account Subledger API
-  version: 0.2.0
+  version: 0.3.0
   description: >
     Owns loan account state (booking, disbursement, repayment, delinquency, payoff,
-    charge-off, modification) and orchestrates calls to Party/CIF, the General Ledger
-    & Posting Engine, and Payment Execution on the loan account's behalf. Cumulative
-    across change sets: this file now carries CB-BOOK (Loan Account Booking),
-    CB-DISB (Loan Disbursement Processing), CB-ACCR (Daily Interest Accrual),
-    CB-REPAY (Loan Repayment Processing), and CB-DELINQ (Delinquency & Past-Due Fee
-    Assessment) paths. Other epics' paths are added by their own change sets
-    against this same file. Note that CB-REPAY, unlike the other epics, has no
-    synchronous "create" endpoint — a Repayment is created only as a side effect
-    of consuming a PaymentReceived event (payment-execution-events.yaml); this
-    file exposes only the read and reversal surface for it. CB-DELINQ follows the
-    same daily-batch shape as CB-ACCR (a read-only eligibility/status list plus a
-    batch-trigger action), and is the epic that actually sets the
-    LoanAccount.nonAccrualFlag field CB-ACCR's eligibility exclusion already
-    reads.
+    charge-off, modification) and orchestrates calls to PartyAPI, GLPostingAPI, and
+    PaymentAPI on the loan account's behalf. Retrofitted to the API/Event Spec
+    Agent's conventions (v0.3.0, BREAKING from v0.2.0):
+    (1) Money fields are the shared {amount: integer minor-units, currency}
+    object; TermSet/TermVersion/LoanAccount are now the shared
+    ../schemas/loan-account.schema.json objects referenced via $ref, not
+    declared inline — annualInterestRate (decimal) is renamed
+    annualInterestRateBps (integer basis points) as part of that move.
+    (2) Every mutating operation's idempotency key moves from a body field
+    (approvalReferenceId, disbursementId, etc.) to a required `Idempotency-Key`
+    header. Batch-trigger operations (runDailyAccrual,
+    runDailyDelinquencyAssessment) are the deliberate exception — they are
+    idempotent by construction on their own (asOf, partitionIndex) body
+    parameters, so no additional header is required; this is called out
+    explicitly per operation rather than left as a silent inconsistency.
+    (3) New operation: receiveRepaymentNotification. CB-REPAY originally
+    modeled repayment creation as purely event-driven (PaymentAPI publishes
+    payment.received, AccountAPI subscribes). Retrofitted to add a
+    synchronous, Idempotency-Key-bearing endpoint as the authoritative trigger
+    — the async event still exists for other consumers/audit, but this
+    endpoint is now the source of truth PaymentAPI calls directly, matching
+    the API/Event Spec Agent's explicit naming of this as one of the three
+    canonical balance-affecting operations.
+    (4) CB-PAYOFF (Early Settlement / Loan Payoff) paths added in this same
+    increment: payoff quotes are read-only; settlement reuses
+    receiveRepaymentNotification via an optional payoffQuoteId field rather
+    than a separate endpoint, since a payoff payment IS an inbound payment,
+    just one tagged with a quote reference.
   contact:
     name: Loan Account Subledger team
-  x-epics: [CB-BOOK, CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ]
+  x-adapter: AccountAdapter
+  x-epics: [CB-BOOK, CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF]
   x-req-ids:
     - REQ-CB-BOOK-001
     - REQ-CB-BOOK-002
@@ -57,6 +72,15 @@ info:
     - REQ-CB-DELINQ-006
     - REQ-CB-DELINQ-007
     - REQ-CB-DELINQ-008
+    - REQ-CB-PAYOFF-001
+    - REQ-CB-PAYOFF-002
+    - REQ-CB-PAYOFF-003
+    - REQ-CB-PAYOFF-004
+    - REQ-CB-PAYOFF-005
+    - REQ-CB-PAYOFF-006
+    - REQ-CB-PAYOFF-007
+    - REQ-CB-PAYOFF-008
+    - REQ-CB-PAYOFF-009
 
 servers:
   - url: https://las.internal.core-banking.example/v1
@@ -74,12 +98,15 @@ paths:
         REQ-CB-BOOK-001, 003, 004, 006. Creates a loan account in "Approved"
         (undisbursed) status with an immutable term version v1. Underwriting/credit
         decisioning is out of scope — this endpoint only ingests an already-approved
-        decision. Idempotent on `approvalReferenceId`: replaying the same value with
+        decision. Idempotent on the Idempotency-Key header (value = the
+        approvalReferenceId the caller is booking): replaying the same key with
         an identical payload returns the original resource (200) rather than
         creating a duplicate. Malformed/missing required terms are rejected
-        synchronously (400) rather than persisted. No balance is posted at any point
-        in this flow — see PostingRuleImpact: none, by design.
+        synchronously (400) rather than persisted. No balance is posted at any
+        point in this flow — zero GLPostingAPI calls, by design.
       tags: [Booking]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -88,13 +115,14 @@ paths:
               $ref: '#/components/schemas/LoanAccountBookingRequest'
             examples:
               standard:
+                summary: "Idempotency-Key = a1b2c3d4-1111-4a5b-9c8d-2e3f4a5b6c7d"
                 value:
                   approvalReferenceId: "a1b2c3d4-1111-4a5b-9c8d-2e3f4a5b6c7d"
                   partyId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
                   bookedBy: "origination-system"
                   terms:
-                    principalAmount: 15000.00
-                    annualInterestRate: 0.1499
+                    principalAmount: { amount: 1500000, currency: USD }
+                    annualInterestRateBps: 1499
                     termMonths: 36
                     dayCountConvention: ACTUAL_365
       responses:
@@ -103,45 +131,47 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/LoanAccount'
+                $ref: '../schemas/loan-account.schema.json#/$defs/LoanAccount'
         '200':
           description: Idempotent replay — original loan account resource returned unchanged
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/LoanAccount'
+                $ref: '../schemas/loan-account.schema.json#/$defs/LoanAccount'
         '400':
           description: >
             A required term (principal, rate, term, or day-count convention) is
             missing or malformed (REQ-CB-BOOK-001). No account is created. LAS also
-            publishes LoanBookingRejected so the rejection lands on Batch/EOD's
+            publishes loan.booking.rejected so the rejection lands on Batch/EOD's
             exception queue rather than only existing as an unlogged API error.
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: partyId does not resolve to an existing party
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
         '409':
-          description: The same approvalReferenceId was reused with a materially different payload
+          description: Idempotency-Key reused with a materially different payload
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
         '422':
           description: >
             REQ-CB-BOOK-002. Party/CIF validation failed — party is Blocked, Closed,
             or KYC is not Verified. No account is created; see `code` on the returned
             Error for the specific reason (PARTY_BLOCKED, PARTY_CLOSED,
-            KYC_NOT_VERIFIED). LAS also publishes LoanBookingRejected.
+            KYC_NOT_VERIFIED). LAS also publishes loan.booking.rejected.
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /loan-accounts/{loanAccountId}:
     get:
@@ -157,13 +187,100 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/LoanAccount'
+                $ref: '../schemas/loan-account.schema.json#/$defs/LoanAccount'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
-          description: Not found
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /loan-accounts/{loanAccountId}/payoff-quote:
+    get:
+      operationId: getPayoffQuote
+      summary: Generate a payoff quote for a loan account
+      description: >
+        REQ-CB-PAYOFF-001, 002, 003. Read-only — has no side effects and posts
+        nothing; this is a live calculation, not a cached/idempotent resource,
+        since the underlying balance can change between calls (e.g. a same-day
+        repayment). Returns outstanding principal, interest projected from the
+        last confirmed accrual through `goodThrough`, and any outstanding fees,
+        itemized separately (REQ-CB-PAYOFF-002). The returned `quoteId` is what
+        a subsequent payoff payment must reference (as
+        receiveRepaymentNotification's `payoffQuoteId`) for the payment to be
+        matched against this specific quote rather than treated as an ordinary
+        repayment.
+      tags: [Payoff]
+      parameters:
+        - $ref: '#/components/parameters/LoanAccountId'
+        - name: goodThrough
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Itemized payoff quote, valid through goodThrough
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/PayoffQuote'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Loan account not found, or not in a status eligible for payoff (e.g. already Closed)
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /payoffs/{payoffId}:
+    get:
+      operationId: getPayoff
+      summary: Retrieve the current state of a payoff
+      description: >
+        REQ-CB-PAYOFF-004 through 009. Polling fallback for clients not
+        consuming loan.account.closed. `payoffId` is always the originating
+        paymentReferenceId from the receiveRepaymentNotification call that
+        settled it — same no-separate-ID-space convention as Repayment/Fee.
+        There is no reversal endpoint for a Payoff in this increment — a
+        returned/NSF payoff payment is not yet a specified flow (open question
+        carried from the Design Doc); Ops must currently handle that case
+        manually outside this API.
+      tags: [Payoff]
+      parameters:
+        - name: payoffId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current payoff state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payoff'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /loan-accounts:accrual-eligible:
     get:
@@ -171,15 +288,14 @@ paths:
       summary: List loan accounts eligible for interest accrual as of a business date
       description: >
         REQ-CB-ACCR-001, 005, 006. Read-only — has no side effects and posts
-        nothing. Eligible means status = "Disbursed"/Active as of start of `asOf`,
+        nothing. Eligible means status = "Disbursed" as of start of `asOf`,
         excluding Non-Accrual/Suspended (REQ-CB-ACCR-005) and accounts that reached
         zero principal or Closed status before the batch cutoff on `asOf`
         (REQ-CB-ACCR-006). Supports `partitionIndex`/`partitionCount` so Batch/EOD
-        can fan this out across parallel workers to fit the overnight window
-        (NFR: partition eligible accounts, don't loop serially over the full
-        portfolio). When `includeExcluded=true`, the response also lists accounts
-        that were considered but excluded, with a reason each — REQ-CB-ACCR-001
-        requires exclusions to be explicit and logged, never silently absent.
+        can fan this out across parallel workers to fit the overnight window.
+        When `includeExcluded=true`, the response also lists accounts that were
+        considered but excluded, with a reason each — REQ-CB-ACCR-001 requires
+        exclusions to be explicit and logged, never silently absent.
       tags: [Accrual]
       parameters:
         - name: asOf
@@ -222,11 +338,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/AccrualEligibilityPage'
         '400':
-          description: partitionIndex/partitionCount invalid, or asOf malformed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /loan-accounts:accrue:
     post:
@@ -236,16 +354,18 @@ paths:
         REQ-CB-ACCR-001 through 007. For every account eligible as of `asOf`
         (same eligibility rule as GET /loan-accounts:accrual-eligible), computes
         the day's interest from the term version in effect and posts PR-ACCR-01
-        via the General Ledger & Posting Engine, with `sourceEventId` of the form
-        `accr:{loanAccountId}:{asOf}` — GL's own idempotency on that key is the
-        second layer of protection beyond this endpoint's own (loanAccountId,
-        asOf) idempotency, so retrying a partially-failed run never double-accrues
-        (REQ-CB-ACCR-003). Supports the same `partitionIndex`/`partitionCount`
-        fan-out as the eligibility read. Returns a summary Batch/EOD uses directly
-        for the completeness cross-check (REQ-CB-ACCR-007); any account that was
-        eligible but failed to post is listed in `failedAccountIds`, which should
-        drive an AccrualExceptionRaised event (see batch-eod-events.yaml) if
-        non-empty once every partition reports in.
+        via GLPostingAPI, using an Idempotency-Key of the form
+        `accr:{loanAccountId}:{asOf}` for each individual posting — GLPostingAPI's
+        own idempotency on that key is what makes a partially-failed run safe to
+        retry (REQ-CB-ACCR-003). This endpoint itself takes NO Idempotency-Key
+        header: it is idempotent by construction on its own (asOf, partitionIndex)
+        body parameters — a second call with the same body is always safe to
+        retry, so an additional client-generated token would be redundant.
+        Returns a summary Batch/EOD uses directly for the completeness
+        cross-check (REQ-CB-ACCR-007); any account that was eligible but failed
+        to post is listed in `failedAccountIds`, which should drive an
+        accrual.exception.raised event if non-empty once every partition
+        reports in.
       tags: [Accrual]
       requestBody:
         required: true
@@ -264,17 +384,19 @@ paths:
                   partitionCount: 16
       responses:
         '200':
-          description: Batch run completed (idempotent replay if this asOf/partition already completed — returns the original summary)
+          description: Batch run completed (safe to retry — returns the same summary for an already-completed asOf/partition)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/AccrualBatchSummary'
         '400':
-          description: partitionIndex/partitionCount invalid, or asOf malformed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /loan-accounts:past-due:
     get:
@@ -283,12 +405,10 @@ paths:
       description: >
         REQ-CB-DELINQ-001. Read-only — has no side effects and posts nothing.
         Past due means cumulative scheduled amount due through `asOf` exceeds
-        cumulative amounts posted via repayment processing (PR-REPAY-01); an
-        account current on its schedule, even if a payment was received late but
-        within the same cycle, is not included. Reads only posted repayment
-        entries, never an unconfirmed or pending payment. Supports the same
-        `partitionIndex`/`partitionCount` fan-out as
-        GET /loan-accounts:accrual-eligible for the same overnight-window reason.
+        cumulative amounts posted via PR-REPAY-01; an account current on its
+        schedule, even if a payment was received late but within the same
+        cycle, is not included. Reads only posted repayment entries, never an
+        unconfirmed or pending payment.
       tags: [Delinquency]
       parameters:
         - name: asOf
@@ -332,11 +452,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/PastDueAccountPage'
         '400':
-          description: partitionIndex/partitionCount invalid, or asOf malformed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /loan-accounts:assess-delinquency:
     post:
@@ -344,20 +466,16 @@ paths:
       summary: Execute the daily delinquency assessment batch for a business date
       description: >
         REQ-CB-DELINQ-001 through 005, 008. For every account with a payment
-        schedule: updates the DPD count/bucket for `asOf` (REQ-CB-DELINQ-003,
-        idempotent per (loanAccountId, asOf) — a same-day re-run never
-        double-increments); for accounts newly past their contractual grace
-        period, posts PR-DELINQ-01 via the General Ledger & Posting Engine with
-        `sourceEventId` of the form `late-fee:{loanAccountId}:{scheduledDueDate}`
-        (REQ-CB-DELINQ-002, 004 — the deterministic key is what makes a retry
-        idempotent per missed installment, the same convention CB-ACCR uses for
-        `sourceEventId`); and for accounts whose DPD crosses the non-accrual
-        threshold, sets LoanAccount.nonAccrualFlag = true with nonAccrualSince =
-        `asOf` (REQ-CB-DELINQ-005) — a LoanAccount field update, not a posting.
-        Publishes DelinquencyStatusChanged for every account whose dpdBucket
-        changed (new delinquency, cure, or bucket escalation). Supports the same
-        partitioning as the accrual batch. Returns a summary Batch/EOD uses for
-        the fees-vs-DPD-changes completeness check (REQ-CB-DELINQ-008).
+        schedule: updates the DPD count/bucket for `asOf` (REQ-CB-DELINQ-003);
+        for accounts newly past their contractual grace period, posts
+        PR-DELINQ-01 via GLPostingAPI using an Idempotency-Key of the form
+        `late-fee:{loanAccountId}:{scheduledDueDate}` (REQ-CB-DELINQ-002, 004);
+        and for accounts whose DPD crosses the non-accrual threshold, sets
+        LoanAccount.nonAccrualFlag = true with nonAccrualSince = `asOf`
+        (REQ-CB-DELINQ-005). Publishes delinquency.status.changed for every
+        account whose dpdBucket changed. Like runDailyAccrual, this endpoint
+        takes no Idempotency-Key header — idempotent by construction on its own
+        (asOf, partitionIndex) body parameters.
       tags: [Delinquency]
       requestBody:
         required: true
@@ -376,17 +494,19 @@ paths:
                   partitionCount: 16
       responses:
         '200':
-          description: Batch run completed (idempotent replay if this asOf/partition already completed — returns the original summary)
+          description: Batch run completed (safe to retry — returns the same summary for an already-completed asOf/partition)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/DelinquencyBatchSummary'
         '400':
-          description: partitionIndex/partitionCount invalid, or asOf malformed
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /fees/{feeId}:
     get:
@@ -395,8 +515,7 @@ paths:
       description: >
         REQ-CB-DELINQ-002, 004, 007. `feeId` is always the deterministic
         `late-fee:{loanAccountId}:{scheduledDueDate}` string, same value used as
-        GL's sourceEventId for PR-DELINQ-01 — no separate ID space, mirroring
-        CB-REPAY's repaymentId convention.
+        GLPostingAPI's Idempotency-Key for PR-DELINQ-01.
       tags: [Delinquency]
       parameters:
         - name: feeId
@@ -411,12 +530,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Fee'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
-          description: Not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /fees/{feeId}:waive:
     post:
@@ -424,14 +547,13 @@ paths:
       summary: Waive a previously assessed late fee
       description: >
         REQ-CB-DELINQ-007. Requires the fee to be in "Assessed" status. Posts
-        PR-DELINQ-02 (reversal of PR-DELINQ-01) via the General Ledger & Posting
-        Engine; the original assessment entry is never edited. `confirmedBy` and
-        `reasonCode` are both required on every call — REQ-CB-DELINQ-007 mandates
-        an authorization record (who approved, and why), not an optional
-        annotation, and GL's PR-DELINQ-02 posting carries that same
-        confirmedBy/reasonCode pair in its `metadata` (see gl-posting-engine.yaml)
-        so the authorization is retained on the ledger entry itself, not only in
-        LAS's own record.
+        PR-DELINQ-02 (reversal of PR-DELINQ-01) via GLPostingAPI, using
+        metadata.waivedBy/reasonCode carried through from this request; the
+        original assessment entry is never edited. `confirmedBy` and
+        `reasonCode` are both required — a mandatory authorization record, not
+        an optional annotation. Idempotent on the Idempotency-Key header (value
+        = `{feeId}:waive`): a retried call returns the original waiver outcome
+        rather than attempting a second GL posting.
       tags: [Delinquency]
       parameters:
         - name: feeId
@@ -439,6 +561,7 @@ paths:
           required: true
           schema:
             type: string
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -452,12 +575,114 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Fee'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '409':
-          description: Fee is not in "Assessed" status (already waived, or not yet assessed)
+          description: Fee is not in "Assessed" status (already waived, or not yet assessed), or Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /repayments:notify:
+    post:
+      operationId: receiveRepaymentNotification
+      summary: Receive notification of an inbound payment (repayment or payoff) and process it
+      description: >
+        REQ-CB-REPAY-001 through 005; REQ-CB-PAYOFF-003 through 008. Called
+        synchronously by PaymentAPI immediately upon receipt of an inbound
+        payment. Idempotent on the Idempotency-Key header (value =
+        paymentReferenceId): a retried call returns the original outcome and
+        never re-applies the payment. Branches on `payoffQuoteId`:
+        (a) absent → standard repayment path — matches `loanAccountRef` to
+        exactly one active loan account (REQ-CB-REPAY-001; ambiguous/no match
+        publishes payment.match.failed and returns a Repayment with status
+        Unmatched, still 201/200, not an error — the payment was received
+        successfully, it just couldn't be matched), then applies the
+        fees→interest→principal waterfall and posts PR-REPAY-01
+        (REQ-CB-REPAY-002, 003).
+        (b) present and references a valid, unexpired PayoffQuote, with amount
+        exactly equal to the quote total → posts PR-PAYOFF-01 for that exact
+        amount, closes the loan account once GLPostingAPI confirms
+        (REQ-CB-PAYOFF-004, 005, 006), and returns a Payoff resource instead of
+        a Repayment.
+        (c) present but amount is LESS than the quote total → degrades to the
+        standard repayment path (REQ-CB-PAYOFF-007); the account is not closed
+        and a new quote is required.
+        (d) present but amount EXCEEDS the quote total → posts PR-PAYOFF-01 for
+        exactly the quoted amount, closes the account, and routes the excess to
+        Payoff.suspenseAmount (REQ-CB-PAYOFF-007) — mirroring how an
+        over-scoped ordinary repayment routes excess to Repayment.suspenseAmount.
+        (e) present but the quote is expired (past goodThrough) or not found →
+        treated as case (a), same as if no payoffQuoteId had been sent
+        (REQ-CB-PAYOFF-003's "quote is rejected as expired" becomes, for
+        already-received money, "falls back to ordinary repayment processing"
+        rather than a synchronous rejection, since there is no caller left to
+        reject to once funds have arrived — flagged as an open question in the
+        Design Doc, resolved here as the least-surprising default rather than
+        silently dropping the payment).
+      tags: [Repayment, Payoff]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReceiveRepaymentNotificationRequest'
+            examples:
+              repayment:
+                summary: "Idempotency-Key = ACH-2026081600123456"
+                value:
+                  loanAccountRef: "LN-000482910"
+                  amount: { amount: 51000, currency: USD }
+                  rail: ACH
+                  receivedAt: "2026-08-16T09:12:00Z"
+              payoff:
+                summary: "Idempotency-Key = WIRE-2026081600009321"
+                value:
+                  loanAccountRef: "LN-000482910"
+                  payoffQuoteId: "c4d5e6f7-2222-4a5b-9c8d-3f4a5b6c7d8e"
+                  amount: { amount: 1500000, currency: USD }
+                  rail: WIRE
+                  receivedAt: "2026-08-16T09:12:00Z"
+      responses:
+        '201':
+          description: Payment processed (Repayment or Payoff created, per the branching above)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                oneOf:
+                  - $ref: '#/components/schemas/Repayment'
+                  - $ref: '#/components/schemas/Payoff'
+        '200':
+          description: Idempotent replay — original outcome returned, nothing re-applied
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Repayment'
+                  - $ref: '#/components/schemas/Payoff'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /repayments/{repaymentId}:
     get:
@@ -465,10 +690,8 @@ paths:
       summary: Retrieve the current state of a repayment
       description: >
         REQ-CB-REPAY-001 through 004, 006. Polling fallback for clients not
-        consuming LoanRepaymentPosted/PaymentUnmatched. `repaymentId` is always
-        the originating `paymentReferenceId` from PaymentReceived — LAS mints no
-        separate ID space, since that reference already serves as the natural
-        idempotency key (REQ-CB-REPAY-004).
+        consuming loan.repayment.posted/payment.match.failed. `repaymentId` is
+        always the originating paymentReferenceId — no separate ID space.
       tags: [Repayment]
       parameters:
         - name: repaymentId
@@ -483,12 +706,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Repayment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
-          description: Not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /repayments/{repaymentId}:reverse:
     post:
@@ -496,18 +723,12 @@ paths:
       summary: Reverse a returned/NSF repayment, or correct a misapplied one
       description: >
         REQ-CB-REPAY-007. Requires the repayment to be in "Posted" status.
-        Always posts PR-REPAY-02 (undoing the original allocation in full) via
-        the General Ledger & Posting Engine; the original PR-REPAY-01 entry is
-        never edited. When `reasonCode = MISAPPLIED`, also books a fresh
-        PR-REPAY-01 against `correctedLoanAccountId` using the standard waterfall,
-        under a new, deterministic sourceEventId (`{repaymentId}:correction`) —
-        never the original sourceEventId, since that is permanently bound to the
-        now-reversed entry and GL's idempotency would just return it unchanged
-        rather than post anything new. The correction is exposed as its own
-        Repayment resource at `correctedRepaymentId`, so retrying this same
-        reversal call is idempotent: a second call with `reasonCode = MISAPPLIED`
-        against an already-corrected repayment returns the original
-        `correctedRepaymentId` rather than creating a second correction.
+        Always posts PR-REPAY-02 via GLPostingAPI; the original PR-REPAY-01
+        entry is never edited. When `reasonCode = MISAPPLIED`, also books a
+        fresh PR-REPAY-01 against `correctedLoanAccountId` under a new
+        Idempotency-Key (`{repaymentId}:correction`). Idempotent on this
+        operation's own Idempotency-Key header (value = `{repaymentId}:reverse`):
+        a retried call returns the original result rather than reversing twice.
       tags: [Repayment]
       parameters:
         - name: repaymentId
@@ -515,6 +736,7 @@ paths:
           required: true
           schema:
             type: string
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -544,14 +766,20 @@ paths:
           description: reasonCode = MISAPPLIED without correctedLoanAccountId
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '409':
-          description: Repayment is not in "Posted" status
+          description: Repayment is not in "Posted" status, or Idempotency-Key reused with a materially different payload
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /loan-accounts/{loanAccountId}/disbursements:
     post:
@@ -560,14 +788,14 @@ paths:
       description: >
         REQ-CB-DISB-001. Accepts a disbursement request for a loan account currently
         in "Approved" status. Does not move any balance — the resulting resource is
-        created in "PendingDisbursement" state. Idempotent on `disbursementId`:
-        replaying the same `disbursementId` with an identical payload returns the
-        original resource (200) rather than creating a duplicate (REQ-CB-DISB-004
-        governs the downstream posting/payment idempotency; this endpoint's own
-        idempotency is the entry point for that guarantee).
+        created in "PendingDisbursement" state. Idempotent on the Idempotency-Key
+        header (value = disbursementId): replaying the same key with an identical
+        payload returns the original resource (200) rather than creating a
+        duplicate.
       tags: [Disbursement]
       parameters:
         - $ref: '#/components/parameters/LoanAccountId'
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -576,8 +804,8 @@ paths:
               $ref: '#/components/schemas/DisbursementRequest'
             examples:
               standard:
+                summary: "Idempotency-Key = 3f2a9e2e-6b1a-4c9d-8b3a-1e2f3a4b5c6d"
                 value:
-                  disbursementId: "3f2a9e2e-6b1a-4c9d-8b3a-1e2f3a4b5c6d"
                   requestedBy: "loan.officer.jsmith"
       responses:
         '201':
@@ -592,20 +820,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Disbursement'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Loan account not found
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
         '409':
           description: >
-            Loan account is not in "Approved" status, OR the same disbursementId was
+            Loan account is not in "Approved" status, OR the Idempotency-Key was
             reused with a materially different payload
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
         '422':
           description: >
             Party/CIF validation failed (REQ-CB-DISB-002) — party blocked, closed, or
@@ -614,12 +846,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Disbursement'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /loan-accounts/{loanAccountId}/disbursements/{disbursementId}:
     get:
       operationId: getDisbursement
       summary: Retrieve the current state of a disbursement request
-      description: REQ-CB-DISB-001, 003, 004, 007 — polling fallback for clients not consuming the LoanAccountDisbursed event.
+      description: REQ-CB-DISB-001, 003, 004, 007 — polling fallback for clients not consuming loan.account.disbursed.
       tags: [Disbursement]
       parameters:
         - $ref: '#/components/parameters/LoanAccountId'
@@ -636,12 +870,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Disbursement'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
-          description: Disbursement not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /loan-accounts/{loanAccountId}/disbursements/{disbursementId}:reverse:
     post:
@@ -649,11 +887,11 @@ paths:
       summary: Trigger a reversal of a failed/returned disbursement
       description: >
         REQ-CB-DISB-007. Ops-confirmed reversal path. Only valid when the disbursement
-        is in "Disbursed" status and Payment Execution has reported the payment as
+        is in "Disbursed" status and PaymentAPI has reported the payment as
         returned/failed. Orchestrates a new offsetting journal entry (PR-DISB-02) via
-        the General Ledger & Posting Engine; the original PR-DISB-01 entry is never
-        edited. The loan account reverts to "Approved" only after GL confirms the
-        reversal entry.
+        GLPostingAPI; the original PR-DISB-01 entry is never edited. The loan account
+        reverts to "Approved" only after GL confirms the reversal entry. Idempotent
+        on the Idempotency-Key header (value = `{disbursementId}:reverse`).
       tags: [Disbursement]
       parameters:
         - $ref: '#/components/parameters/LoanAccountId'
@@ -663,6 +901,7 @@ paths:
           schema:
             type: string
             format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -679,17 +918,26 @@ paths:
                   enum: [PAYMENT_RETURNED, PAYMENT_FAILED, RAIL_REJECTED]
       responses:
         '202':
-          description: Reversal accepted and in progress; final state delivered via LoanAccountDisbursed-superseding state change, poll GET for terminal status
+          description: Reversal accepted and in progress; poll GET for terminal status
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Disbursement'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '409':
-          description: Disbursement is not in a reversible state
+          description: Disbursement is not in a reversible state, or Idempotency-Key reused with a materially different payload
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
 components:
   parameters:
@@ -700,6 +948,14 @@ components:
       schema:
         type: string
         format: uuid
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-supplied retry-safety token for this specific business event. Value convention documented per operation.
+      schema:
+        type: string
 
   securitySchemes:
     serviceAuth:
@@ -715,12 +971,210 @@ components:
             loan-subledger:disbursement:read: Read disbursement status
             loan-subledger:accrual:write: Trigger the daily accrual batch
             loan-subledger:accrual:read: Read accrual eligibility
-            loan-subledger:repayment:write: Reverse/correct repayments
+            loan-subledger:repayment:write: Receive repayment notifications and reverse/correct repayments
             loan-subledger:repayment:read: Read repayment status
             loan-subledger:delinquency:write: Trigger the daily delinquency batch and waive fees
             loan-subledger:delinquency:read: Read past-due status and fee state
+            loan-subledger:payoff:read: Generate payoff quotes and read payoff status
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Unauthorized:
+      description: Missing or invalid access token
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Forbidden:
+      description: Token valid but missing the required scope
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    InternalServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
 
   schemas:
+    LoanAccountBookingRequest:
+      type: object
+      required: [approvalReferenceId, partyId, bookedBy, terms]
+      properties:
+        approvalReferenceId:
+          type: string
+          format: uuid
+          description: Must equal the Idempotency-Key header value (REQ-CB-BOOK-004)
+        partyId:
+          type: string
+          format: uuid
+        bookedBy:
+          type: string
+        terms:
+          $ref: '../schemas/loan-account.schema.json#/$defs/TermSet'
+
+    PayoffQuote:
+      type: object
+      required: [quoteId, loanAccountId, goodThrough, principalAmount, projectedInterestAmount, feesAmount, totalAmountDue, generatedAt]
+      properties:
+        quoteId:
+          type: string
+          format: uuid
+        loanAccountId:
+          type: string
+          format: uuid
+        goodThrough:
+          type: string
+          format: date
+        principalAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        projectedInterestAmount:
+          allOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
+          description: Interest from the last confirmed PR-ACCR-01 posting through goodThrough
+        feesAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        totalAmountDue:
+          allOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
+          description: principalAmount + projectedInterestAmount + feesAmount
+        generatedAt:
+          type: string
+          format: date-time
+
+    Payoff:
+      type: object
+      required: [payoffId, loanAccountId, quoteId, status, amountPosted, suspenseAmount, closedAt, updatedAt]
+      properties:
+        payoffId:
+          type: string
+        loanAccountId:
+          type: string
+          format: uuid
+        quoteId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [Posted, Closed]
+        amountPosted: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        suspenseAmount:
+          allOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
+          description: REQ-CB-PAYOFF-007. Any amount received in excess of the quote total.
+        journalEntryId:
+          type: ["string", "null"]
+          format: uuid
+          description: Set once PR-PAYOFF-01 is confirmed posted
+        closedAt:
+          type: ["string", "null"]
+          format: date-time
+          description: REQ-CB-PAYOFF-006. Set only once the loan account transitions to Closed, which happens only after GL confirms the posting.
+        updatedAt:
+          type: string
+          format: date-time
+
+    AccrualEligibleAccount:
+      type: object
+      required: [loanAccountId, principalBasis, annualInterestRateBps, dayCountConvention, termVersion]
+      properties:
+        loanAccountId:
+          type: string
+          format: uuid
+        principalBasis:
+          allOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
+          description: Start-of-day outstanding principal used as the accrual basis (REQ-CB-ACCR-004)
+        annualInterestRateBps:
+          type: integer
+        dayCountConvention:
+          type: string
+          enum: [ACTUAL_365, ACTUAL_360, THIRTY_360]
+        termVersion:
+          type: integer
+
+    AccrualExclusion:
+      type: object
+      required: [loanAccountId, reasonCode]
+      properties:
+        loanAccountId:
+          type: string
+          format: uuid
+        reasonCode:
+          type: string
+          enum: [PENDING_DISBURSEMENT, CLOSED, NON_ACCRUAL, SUSPENDED, CHARGED_OFF]
+          description: REQ-CB-ACCR-001 requires every exclusion to carry an explicit reason, never a silent omission.
+
+    AccrualEligibilityPage:
+      type: object
+      required: [asOf, eligibleAccounts, nextCursor]
+      properties:
+        asOf:
+          type: string
+          format: date
+        eligibleAccounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccrualEligibleAccount'
+        excludedAccounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccrualExclusion'
+        nextCursor:
+          type: ["string", "null"]
+
+    AccrualBatchRequest:
+      type: object
+      required: [asOf]
+      properties:
+        asOf:
+          type: string
+          format: date
+        partitionIndex:
+          type: integer
+          minimum: 0
+        partitionCount:
+          type: integer
+          minimum: 1
+
+    AccrualBatchSummary:
+      type: object
+      required: [asOf, eligibleAccountCount, postedCount, excludedCount, failedAccountIds, startedAt, completedAt, status]
+      properties:
+        asOf:
+          type: string
+          format: date
+        partitionIndex:
+          type: ["integer", "null"]
+        partitionCount:
+          type: ["integer", "null"]
+        eligibleAccountCount:
+          type: integer
+        postedCount:
+          type: integer
+        excludedCount:
+          type: integer
+        failedAccountIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        startedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [Completed, PartiallyFailed]
+
     PastDueAccount:
       type: object
       required: [loanAccountId, dpd, dpdBucket, scheduledAmountDue, postedAmount, pastDueAmount, gracePeriodExpired, nonAccrualFlag]
@@ -734,18 +1188,11 @@ components:
         dpdBucket:
           type: string
           enum: ["Current", "1-29", "30-59", "60-89", "90+"]
-        scheduledAmountDue:
-          type: number
-          description: Cumulative amount due through asOf per the contractual schedule
-        postedAmount:
-          type: number
-          description: Cumulative amount posted via PR-REPAY-01 through asOf
-        pastDueAmount:
-          type: number
-          description: scheduledAmountDue - postedAmount
+        scheduledAmountDue: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        postedAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        pastDueAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
         gracePeriodExpired:
           type: boolean
-          description: Whether the contractual grace period has elapsed for the oldest missed installment (REQ-CB-DELINQ-002 trigger)
         nonAccrualFlag:
           type: boolean
 
@@ -792,10 +1239,8 @@ components:
           type: integer
         newlyPastDueCount:
           type: integer
-          description: Accounts whose dpdBucket changed from "Current" to a past-due bucket this run
         feesAssessedCount:
           type: integer
-          description: PR-DELINQ-01 entries confirmed posted (new or already-posted-on-retry)
         nonAccrualFlaggedCount:
           type: integer
         failedAccountIds:
@@ -803,7 +1248,6 @@ components:
           items:
             type: string
             format: uuid
-          description: Accounts that should have been assessed but were not — feeds RepaymentException-style completeness checking (REQ-CB-DELINQ-008) via batch-eod-events.yaml
         startedAt:
           type: string
           format: date-time
@@ -816,7 +1260,7 @@ components:
 
     Fee:
       type: object
-      required: [feeId, loanAccountId, scheduledDueDate, amount, currency, status, assessedAt, updatedAt]
+      required: [feeId, loanAccountId, scheduledDueDate, amount, status, assessedAt, updatedAt]
       properties:
         feeId:
           type: string
@@ -827,19 +1271,13 @@ components:
         scheduledDueDate:
           type: string
           format: date
-          description: The missed installment's contractual due date — part of the idempotency key (REQ-CB-DELINQ-004)
-        amount:
-          type: number
-        currency:
-          type: string
-          pattern: "^[A-Z]{3}$"
+        amount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
         status:
           type: string
           enum: [Assessed, WaivePending, Waived]
         journalEntryId:
           type: ["string", "null"]
           format: uuid
-          description: Set once PR-DELINQ-01 is confirmed posted
         waivedBy:
           type: ["string", "null"]
         waiveReasonCode:
@@ -867,34 +1305,46 @@ components:
           enum: [GOODWILL, BANK_ERROR, HARDSHIP]
         notes:
           type: string
-          description: Optional free-text elaboration beyond the coded reason
 
     Allocation:
       type: object
       required: [feeAmount, interestAmount, principalAmount]
       description: >
-        Same shape as gl-posting-engine.yaml's Allocation schema — duplicated
-        rather than shared across service boundaries, since each module's OpenAPI
-        contract must stand alone (no cross-file $ref between independently
-        deployed services).
+        Same shape as GLPostingAPI's Allocation schema — duplicated rather than
+        shared across service boundaries, since each module's OpenAPI contract
+        must stand alone (Allocation was not in the API/Event Spec Agent's
+        named shared-object list, unlike Money/Party/JournalEntry/LoanAccount/
+        PaymentInstruction/ServiceCase).
       properties:
-        feeAmount:
-          type: number
-          minimum: 0
-        interestAmount:
-          type: number
-          minimum: 0
-        principalAmount:
-          type: number
-          minimum: 0
+        feeAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        interestAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        principalAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+
+    ReceiveRepaymentNotificationRequest:
+      type: object
+      required: [amount, rail, receivedAt]
+      properties:
+        loanAccountRef:
+          type: ["string", "null"]
+          description: Whatever loan-account reference the payer supplied, verbatim. Null/unresolvable drives the Unmatched path (REQ-CB-REPAY-001).
+        payoffQuoteId:
+          type: ["string", "null"]
+          format: uuid
+          description: If present, this payment is a payoff attempt against the referenced PayoffQuote (see receiveRepaymentNotification's branching description).
+        amount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        rail:
+          type: string
+        receivedAt:
+          type: string
+          format: date-time
 
     Repayment:
       type: object
-      required: [repaymentId, status, amount, currency, suspenseAmount, receivedAt, updatedAt]
+      required: [repaymentId, status, amount, suspenseAmount, receivedAt, updatedAt]
       properties:
         repaymentId:
           type: string
-          description: Equal to the originating paymentReferenceId (REQ-CB-REPAY-004)
+          description: Equal to the Idempotency-Key header value used on receiveRepaymentNotification (REQ-CB-REPAY-004)
         loanAccountId:
           type: ["string", "null"]
           format: uuid
@@ -902,36 +1352,26 @@ components:
         status:
           type: string
           enum: [Posted, Unmatched, ReversalPending, Reversed, Corrected]
-        amount:
-          type: number
-          description: Original payment amount as received
-        currency:
-          type: string
-          pattern: "^[A-Z]{3}$"
+        amount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
         allocation:
           $ref: '#/components/schemas/Allocation'
         suspenseAmount:
-          type: number
-          minimum: 0
-          default: 0
+          allOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
           description: >
-            REQ-CB-REPAY-002. Any amount exceeding total outstanding balance
-            (fees+interest+principal), routed here instead of over-applying
-            principal. Full suspense disposition (auto-refund vs. held pending
-            borrower instruction) is a separate, not-yet-specified flow — see
-            Design Doc CB-REPAY open question; this field only records the
+            REQ-CB-REPAY-002. Any amount exceeding total outstanding balance,
+            routed here instead of over-applying principal. Full suspense
+            disposition (auto-refund vs. held pending borrower instruction) is
+            a separate, not-yet-specified flow — this field only records the
             amount, it does not model the disposition workflow.
         journalEntryId:
           type: ["string", "null"]
           format: uuid
-          description: Set once PR-REPAY-01 is confirmed posted; the ID of the reversal (PR-REPAY-02) is not separately exposed here, look it up via GL's sourceEventId search on "{repaymentId}:reversal"
         unmatchedReasonCode:
           type: ["string", "null"]
           enum: [NO_MATCH, AMBIGUOUS_MATCH, null]
-          description: Populated only when status = Unmatched (REQ-CB-REPAY-001)
         correctedRepaymentId:
           type: ["string", "null"]
-          description: Populated only when this repayment was reversed for MISAPPLIED and a correction was booked — points to the new Repayment created against the correct loan account
         receivedAt:
           type: string
           format: date-time
@@ -945,7 +1385,6 @@ components:
       properties:
         confirmedBy:
           type: string
-          description: Operations Analyst confirming the return/misapplication
         reasonCode:
           type: string
           enum: [PAYMENT_RETURNED, MISAPPLIED]
@@ -954,223 +1393,22 @@ components:
           format: uuid
           description: Required when reasonCode = MISAPPLIED; ignored otherwise
 
-    AccrualEligibleAccount:
-      type: object
-      required: [loanAccountId, principalBasis, annualInterestRate, dayCountConvention, termVersion]
-      properties:
-        loanAccountId:
-          type: string
-          format: uuid
-        principalBasis:
-          type: number
-          description: Start-of-day outstanding principal used as the accrual basis (REQ-CB-ACCR-004)
-        annualInterestRate:
-          type: number
-        dayCountConvention:
-          type: string
-          enum: [ACTUAL_365, ACTUAL_360, THIRTY_360]
-        termVersion:
-          type: integer
-          description: The TermVersion.version in effect as of asOf — see CB-BOOK's TermVersion schema
-
-    AccrualExclusion:
-      type: object
-      required: [loanAccountId, reasonCode]
-      properties:
-        loanAccountId:
-          type: string
-          format: uuid
-        reasonCode:
-          type: string
-          enum: [PENDING_DISBURSEMENT, CLOSED, NON_ACCRUAL, SUSPENDED, CHARGED_OFF]
-          description: REQ-CB-ACCR-001 requires every exclusion to carry an explicit reason, never a silent omission.
-
-    AccrualEligibilityPage:
-      type: object
-      required: [asOf, eligibleAccounts, nextCursor]
-      properties:
-        asOf:
-          type: string
-          format: date
-        eligibleAccounts:
-          type: array
-          items:
-            $ref: '#/components/schemas/AccrualEligibleAccount'
-        excludedAccounts:
-          type: array
-          items:
-            $ref: '#/components/schemas/AccrualExclusion'
-          description: Present only when the request set includeExcluded=true
-        nextCursor:
-          type: ["string", "null"]
-          description: Pass as `cursor` to fetch the next page; null when this is the last page
-
-    AccrualBatchRequest:
-      type: object
-      required: [asOf]
-      properties:
-        asOf:
-          type: string
-          format: date
-        partitionIndex:
-          type: integer
-          minimum: 0
-        partitionCount:
-          type: integer
-          minimum: 1
-
-    AccrualBatchSummary:
-      type: object
-      required: [asOf, eligibleAccountCount, postedCount, excludedCount, failedAccountIds, startedAt, completedAt, status]
-      properties:
-        asOf:
-          type: string
-          format: date
-        partitionIndex:
-          type: ["integer", "null"]
-        partitionCount:
-          type: ["integer", "null"]
-        eligibleAccountCount:
-          type: integer
-        postedCount:
-          type: integer
-          description: Accounts for which PR-ACCR-01 is confirmed posted (new or already-posted-on-retry)
-        excludedCount:
-          type: integer
-        failedAccountIds:
-          type: array
-          items:
-            type: string
-            format: uuid
-          description: Eligible accounts for which posting did not succeed — non-empty here should drive an AccrualExceptionRaised event once all partitions for this asOf report in.
-        startedAt:
-          type: string
-          format: date-time
-        completedAt:
-          type: string
-          format: date-time
-        status:
-          type: string
-          enum: [Completed, PartiallyFailed]
-
-    LoanAccountBookingRequest:
-      type: object
-      required: [approvalReferenceId, partyId, bookedBy, terms]
-      properties:
-        approvalReferenceId:
-          type: string
-          format: uuid
-          description: Client-supplied idempotency key for this booking (REQ-CB-BOOK-004)
-        partyId:
-          type: string
-          format: uuid
-        bookedBy:
-          type: string
-          description: Identity of the originating system/user
-        terms:
-          $ref: '#/components/schemas/TermSet'
-
-    TermSet:
-      type: object
-      required: [principalAmount, annualInterestRate, termMonths, dayCountConvention]
-      properties:
-        principalAmount:
-          type: number
-          exclusiveMinimum: 0
-        annualInterestRate:
-          type: number
-          exclusiveMinimum: 0
-          description: Decimal form, e.g. 0.1499 for 14.99%
-        termMonths:
-          type: integer
-          exclusiveMinimum: 0
-        dayCountConvention:
-          type: string
-          enum: [ACTUAL_365, ACTUAL_360, THIRTY_360]
-
-    TermVersion:
-      description: >
-        REQ-CB-BOOK-003. Immutable once created — a modification never edits a
-        TermVersion, it appends a new one with a later effectiveDate (see CB-MOD's
-        forthcoming term-version history endpoint on this same file).
-      allOf:
-        - $ref: '#/components/schemas/TermSet'
-        - type: object
-          required: [version, effectiveDate]
-          properties:
-            version:
-              type: integer
-              minimum: 1
-            effectiveDate:
-              type: string
-              format: date
-
-    LoanAccount:
-      type: object
-      required: [loanAccountId, approvalReferenceId, partyId, status, currentTermVersion, bookedBy, dpd, dpdBucket, nonAccrualFlag, createdAt, updatedAt]
-      properties:
-        loanAccountId:
-          type: string
-          format: uuid
-        approvalReferenceId:
-          type: string
-          format: uuid
-        partyId:
-          type: string
-          format: uuid
-        status:
-          type: string
-          enum: [Approved, PendingDisbursement, Disbursed, Closed, ChargedOff]
-          description: >
-            Full lifecycle enum shared across epics; only "Approved" is reachable
-            via booking itself. Note this is a coarse lifecycle stage, deliberately
-            separate from delinquency: an account stays "Disbursed" while past due
-            — see dpd/dpdBucket/nonAccrualFlag below for the finer-grained overlay
-            CB-DELINQ maintains on top of it.
-        currentTermVersion:
-          $ref: '#/components/schemas/TermVersion'
-        bookedBy:
-          type: string
-        dpd:
-          type: integer
-          minimum: 0
-          description: REQ-CB-DELINQ-003. Consecutive calendar days past due; 0 when current.
-        dpdBucket:
-          type: string
-          enum: ["Current", "1-29", "30-59", "60-89", "90+"]
-        nonAccrualFlag:
-          type: boolean
-          description: REQ-CB-DELINQ-005. Set by CB-DELINQ's daily assessment when dpd crosses the non-accrual threshold; read by CB-ACCR's eligibility exclusion (AccrualExclusion.reasonCode = NON_ACCRUAL).
-        nonAccrualSince:
-          type: ["string", "null"]
-          format: date
-          description: Effective date the flag was set; retained for reporting even if the account later cures (REQ-CB-ACCR-005's "retained for reporting" requirement).
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
-
     DisbursementRequest:
       type: object
-      required: [disbursementId, requestedBy]
+      required: [requestedBy]
       properties:
-        disbursementId:
-          type: string
-          format: uuid
-          description: Client-supplied idempotency key for this disbursement (REQ-CB-DISB-004)
         requestedBy:
           type: string
           description: Identity of the requesting Loan Officer
 
     Disbursement:
       type: object
-      required: [disbursementId, loanAccountId, status, principalAmount, currency, createdAt, updatedAt]
+      required: [disbursementId, loanAccountId, status, principalAmount, createdAt, updatedAt]
       properties:
         disbursementId:
           type: string
           format: uuid
+          description: Equal to the Idempotency-Key header value used on createDisbursement (REQ-CB-DISB-004)
         loanAccountId:
           type: string
           format: uuid
@@ -1178,22 +1416,18 @@ components:
           type: string
           enum: [PendingDisbursement, Rejected, Disbursed, ReversalPending, Reversed]
         principalAmount:
-          type: number
+          allOf:
+            - $ref: '../schemas/money.schema.json#/$defs/Money'
           description: Full undisbursed principal as of booking; not client-supplied
-        currency:
-          type: string
-          pattern: "^[A-Z]{3}$"
         rejectionReason:
           type: ["string", "null"]
-          description: Populated only when status = Rejected (REQ-CB-DISB-002)
         journalEntryId:
           type: ["string", "null"]
           format: uuid
-          description: Set once PR-DISB-01 is confirmed posted by GL
-        paymentId:
+        instructionId:
           type: ["string", "null"]
           format: uuid
-          description: Set once PAY acknowledges the disbursement payment
+          description: The PaymentAPI PaymentInstruction ID once submitted
         requestedBy:
           type: string
         createdAt:
@@ -1202,14 +1436,3 @@ components:
         updatedAt:
           type: string
           format: date-time
-
-    Error:
-      type: object
-      required: [code, message]
-      properties:
-        code:
-          type: string
-        message:
-          type: string
-        details:
-          type: object

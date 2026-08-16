@@ -1,23 +1,20 @@
 asyncapi: 2.6.0
 info:
   title: General Ledger & Posting Engine Events
-  version: 0.2.0
+  version: 0.3.0
   description: >
-    Domain events published by the General Ledger & Posting Engine whenever a
-    JournalEntry is posted. One channel serves every posting rule across every
-    epic — consumers filter on `postingRuleCode`. Cumulative across change sets:
-    documents CB-DISB's rule codes (PR-DISB-01, PR-DISB-02), CB-ACCR's
-    (PR-ACCR-01), CB-REPAY's (PR-REPAY-01, PR-REPAY-02), and CB-DELINQ's
-    (PR-DELINQ-01, PR-DELINQ-02); other epics' rule codes are registered by their
-    own change sets against the same enum in gl-posting-engine.yaml. The payload's
-    `lines` array (not a raw `amount`/`allocation` echo) is what represents
-    multi-credit-line entries like PR-REPAY-01 here — it's the derived result,
-    same for every rule regardless of which input shape produced it, so no
-    separate allocation field was needed on this event the way it was on the
-    synchronous request. `metadata` (added for PR-ACCR-01's audit context,
-    REQ-CB-ACCR-004) now also carries PR-DELINQ-02's mandatory waiver
-    authorization (REQ-CB-DELINQ-007).
-  x-epics: [CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ]
+    Domain events published by GLPostingAdapter whenever a JournalEntry is
+    posted. One channel serves every posting rule across every epic —
+    consumers filter on `postingRuleCode`. Retrofitted to the API/Event Spec
+    Agent's conventions (v0.3.0, BREAKING from v0.2.0): topic renamed from
+    `gl.journal-entry.posted.v1` to `gl.entry.posted` (the
+    "<context>.<entity>.<eventPastTense>" convention, no version suffix —
+    version now lives only in info.version); payload is now the shared
+    JournalEntry object (../schemas/journal-entry.schema.json) referenced via
+    $ref instead of a locally-duplicated schema — this is also where
+    `runningBalanceAfter` (Money, per line) first appears on the event, same
+    as it does on postJournalEntry's synchronous response.
+  x-epics: [CB-DISB, CB-ACCR, CB-REPAY, CB-DELINQ, CB-PAYOFF]
   x-req-ids:
     - REQ-CB-DISB-003
     - REQ-CB-DISB-006
@@ -30,6 +27,7 @@ info:
     - REQ-CB-DELINQ-002
     - REQ-CB-DELINQ-007
     - REQ-CB-DELINQ-008
+    - REQ-CB-PAYOFF-004
 
 defaultContentType: application/json
 
@@ -40,24 +38,18 @@ servers:
     description: Core Banking domain event backbone
 
 channels:
-  gl.journal-entry.posted.v1:
+  gl.entry.posted:
     description: >
       Published once, exactly, for every JournalEntry GL posts — regardless of
-      which module or posting rule triggered it. For CB-DISB: consumed by the
-      Loan Account Subledger (to advance disbursement state from
-      PendingDisbursement to the next step) and Batch/EOD (REQ-CB-DISB-006 daily
-      reconciliation feed). For CB-ACCR: consumed by Batch/EOD only, filtered to
-      postingRuleCode = PR-ACCR-01, as the posted-entry-count side of the
-      eligible-vs-posted completeness check (REQ-CB-ACCR-007) — LAS does not
-      re-consume its own accrual postings, unlike the disbursement case, since
-      REQ-CB-ACCR-002/003 governs the same idempotent posting synchronously within
-      the POST /loan-accounts:accrue call itself. Same non-re-consumption pattern
-      applies to CB-REPAY (PR-REPAY-01/02, posted synchronously within LAS's own
-      PaymentReceived handling) and CB-DELINQ (PR-DELINQ-01/02, posted
-      synchronously within POST /loan-accounts:assess-delinquency and
-      POST /fees/{id}:waive) — Batch/EOD is the only cross-module consumer of
-      this channel; LAS only ever observes its own postings synchronously.
-      x-consumers: [LAS, BEOD]
+      which module or posting rule triggered it. For CB-DISB: consumed by
+      AccountAPI (to advance disbursement state) and Batch/EOD (REQ-CB-DISB-006
+      daily reconciliation feed). For CB-ACCR, CB-REPAY, CB-DELINQ, and
+      CB-PAYOFF: consumed by Batch/EOD only — AccountAPI observes its own
+      postings synchronously within the same request (runDailyAccrual,
+      receiveRepaymentNotification, runDailyDelinquencyAssessment,
+      waiveFee), so it does not re-consume this event for those postings;
+      Batch/EOD is the only cross-module consumer for that set.
+      x-consumers: [AccountAdapter, BatchEodAdapter]
     publish:
       operationId: publishJournalEntryPosted
       summary: A balanced journal entry has been posted
@@ -71,53 +63,4 @@ components:
       title: Journal Entry Posted
       contentType: application/json
       payload:
-        $ref: '#/components/schemas/JournalEntryPostedPayload'
-
-  schemas:
-    JournalEntryPostedPayload:
-      type: object
-      required:
-        - journalEntryId
-        - sourceEventId
-        - postingRuleCode
-        - loanAccountId
-        - lines
-        - postedAt
-      properties:
-        journalEntryId:
-          type: string
-          format: uuid
-        sourceEventId:
-          type: string
-        postingRuleCode:
-          type: string
-          description: See PostingRuleCode enum in gl-posting-engine.yaml
-          examples: [PR-DISB-01, PR-DISB-02, PR-ACCR-01, PR-REPAY-01, PR-REPAY-02, PR-DELINQ-01, PR-DELINQ-02]
-        loanAccountId:
-          type: string
-          format: uuid
-        lines:
-          type: array
-          minItems: 2
-          items:
-            type: object
-            required: [glAccount, direction, amount]
-            properties:
-              glAccount:
-                type: string
-              direction:
-                type: string
-                enum: [DEBIT, CREDIT]
-              amount:
-                type: number
-        postedAt:
-          type: string
-          format: date-time
-        metadata:
-          type: object
-          additionalProperties: true
-          description: Present for PR-ACCR-01 (rate/day-count/principal audit context per REQ-CB-ACCR-004) and PR-DELINQ-02 (mandatory waiver authorization per REQ-CB-DELINQ-007); absent for rules that don't need it.
-      description: >
-        Event payload mirrors the JournalEntry resource GL returns synchronously
-        from POST /journal-entries — this event is the async notification path for
-        subscribers who don't hold the synchronous response.
+        $ref: '../schemas/journal-entry.schema.json#/$defs/JournalEntry'

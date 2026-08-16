@@ -1,0 +1,311 @@
+openapi: 3.1.0
+info:
+  title: CRM API
+  version: 0.1.0
+  description: >
+    CRMAPI — drafted fresh in this increment, since CRM has no prior adapter
+    counterpart in the Personal Loan Solution's Core Banking Adapter Layer.
+    Flagged for the loan domain's architecture team to add CRMAdapter to
+    Section 16.1. Follows the same conventions as PartyAPI/AccountAPI/
+    GLPostingAPI/PaymentAPI (OpenAPI 3.1, shared JSON Schema objects via $ref,
+    Idempotency-Key on mutating operations, full error coverage), with one
+    absolute constraint unique to this file: no request or response schema
+    for logInteraction, openCase, or getCustomer360 may include a Money field
+    under any circumstance. This is enforced structurally — ServiceCase.schema.json
+    (../schemas/service-case.schema.json) has no property anywhere that
+    references money.schema.json, and this file never defines a local field
+    that would reintroduce one. CRM has no path into GLPostingAPI at all;
+    every operation here is either a pure write of non-monetary interaction
+    data or a pure read of status/interaction history — never a balance
+    mutation, and never a trigger for one.
+  x-adapter: CRMAdapter
+  x-adapter-status: PROPOSED — no existing counterpart in the Core Banking Adapter Layer prior to this spec
+  x-epics: [CB-BOOK, CB-DISB, CB-REPAY, CB-DELINQ, CB-PAYOFF]
+  x-req-ids:
+    - REQ-CB-BOOK-005
+    - REQ-CB-DISB-005
+    - REQ-CB-REPAY-005
+    - REQ-CB-DELINQ-006
+    - REQ-CB-PAYOFF-008
+
+servers:
+  - url: https://crm.internal.core-banking.example/v1
+    description: CRM — internal service network only
+
+security:
+  - serviceAuth: []
+
+paths:
+  /interactions:log:
+    post:
+      operationId: logInteraction
+      summary: Log a customer interaction event
+      description: >
+        Write path for the CRM-facing domain events published by other
+        modules' adapters (loan.account.booked, loan.account.disbursed,
+        loan.repayment.posted, delinquency.status.changed, loan.account.closed
+        — see each event's x-consumers: [CRMAdapter, ...] in its own AsyncAPI
+        file). Never a general-purpose note field for balance data — eventType
+        is a closed enum matching exactly those events. Idempotent on the
+        Idempotency-Key header (value = the source event's own idempotency
+        key, e.g. the disbursementId or repaymentId that produced it): a
+        retried call never logs a duplicate interaction.
+      tags: [Interaction]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogInteractionRequest'
+            examples:
+              disbursement:
+                summary: "Idempotency-Key = 3f2a9e2e-6b1a-4c9d-8b3a-1e2f3a4b5c6d"
+                value:
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  eventType: ACCOUNT_DISBURSED
+                  occurredAt: "2026-08-16T09:14:00Z"
+      responses:
+        '201':
+          description: Interaction logged
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/Interaction'
+        '200':
+          description: Idempotent replay — original interaction returned, nothing re-logged
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/Interaction'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /cases:open:
+    post:
+      operationId: openCase
+      summary: Open a new service case
+      description: >
+        Human-initiated (Customer Service Rep), not triggered by a domain
+        event — unlike logInteraction. Idempotent on the Idempotency-Key
+        header (value = caseId): a retried call returns the original case
+        rather than opening a duplicate.
+      tags: [ServiceCase]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenCaseRequest'
+            examples:
+              standard:
+                summary: "Idempotency-Key = d4e5f6a7-3333-4a5b-9c8d-4a5b6c7d8e9f"
+                value:
+                  partyId: "9c8d2e3f-4a5b-6c7d-8b3a-1e2f3a4b5c6d"
+                  loanAccountId: "8b3a1e2f-3a4b-5c6d-9e2e-6b1a4c9d3f2a"
+                  reasonCode: PAYMENT_DISPUTE
+                  assignedTo: "csr.jdoe"
+      responses:
+        '201':
+          description: Case opened
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/ServiceCase'
+        '200':
+          description: Idempotent replay — original case returned, nothing re-opened
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/ServiceCase'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: partyId (or loanAccountId, if supplied) does not resolve to an existing resource
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '409':
+          description: Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /cases/{caseId}:
+    get:
+      operationId: getCase
+      summary: Retrieve a service case
+      tags: [ServiceCase]
+      parameters:
+        - name: caseId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Current case state
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/ServiceCase'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /customers/{partyId}/360:
+    get:
+      operationId: getCustomer360
+      summary: Retrieve a consolidated, non-monetary view of a customer
+      description: >
+        Read model combining loan account status summaries (status only — no
+        principal, balance, or term data), recent interactions, and open
+        cases. This is the operation where the "no Money field under any
+        circumstance" constraint is most tempting to violate (a natural urge
+        to show "current balance" on a 360 view) and most important to hold —
+        Customer360 is explicitly a CRM read model, not a ledger read model;
+        a CSR needing balance data calls AccountAPI directly through a
+        properly scoped, audited path, not through this endpoint.
+      tags: [Customer360]
+      parameters:
+        - name: partyId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Consolidated customer view
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/Customer360'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-supplied retry-safety token. Value convention documented per operation.
+      schema:
+        type: string
+
+  securitySchemes:
+    serviceAuth:
+      type: oauth2
+      description: OAuth2 client-credentials grant, internal service network + mTLS at the transport layer
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.internal.core-banking.example/oauth2/token
+          scopes:
+            crm:interaction:write: Log interactions
+            crm:case:write: Open service cases
+            crm:case:read: Read service cases
+            crm:customer360:read: Read the consolidated customer view
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Unauthorized:
+      description: Missing or invalid access token
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    Forbidden:
+      description: Token valid but missing the required scope
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+    InternalServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+
+  schemas:
+    LogInteractionRequest:
+      type: object
+      required: [loanAccountId, eventType, occurredAt]
+      properties:
+        loanAccountId:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+          enum:
+            - ACCOUNT_BOOKED
+            - ACCOUNT_DISBURSED
+            - REPAYMENT_POSTED
+            - DELINQUENCY_STATUS_CHANGED
+            - ACCOUNT_CLOSED
+            - ACCOUNT_CHARGED_OFF
+            - TERMS_MODIFIED
+        occurredAt:
+          type: string
+          format: date-time
+        notes:
+          type: string
+
+    OpenCaseRequest:
+      type: object
+      required: [partyId, reasonCode]
+      properties:
+        partyId:
+          type: string
+          format: uuid
+        loanAccountId:
+          type: ["string", "null"]
+          format: uuid
+        reasonCode:
+          type: string
+          enum: [GENERAL_INQUIRY, PAYMENT_DISPUTE, HARDSHIP_REQUEST, DELINQUENCY_FOLLOWUP, OTHER]
+        assignedTo:
+          type: ["string", "null"]

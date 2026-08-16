@@ -1,31 +1,26 @@
 asyncapi: 2.6.0
 info:
   title: Loan Account Subledger Events
-  version: 0.2.0
+  version: 0.3.0
   description: >
-    Domain events published by the Loan Account Subledger. Cumulative across change
-    sets: this file now carries CB-BOOK (Loan Account Booking), CB-DISB (Loan
-    Disbursement Processing), CB-REPAY (Loan Repayment Processing), and CB-DELINQ
-    (Delinquency & Past-Due Fee Assessment) events. Note the deliberate asymmetry
-    between CB-DISB and CB-BOOK's rejection handling: CB-DISB's disbursement
-    rejection (REQ-CB-DISB-002) is NOT modeled as an event — it is surfaced only
-    synchronously as a 422 on POST /loan-accounts/{id}/disbursements, since the
-    caller is blocking on that result and no requirement calls for an
-    exception-queue record of it. CB-BOOK's rejection IS modeled as an event
-    (LoanBookingRejected) in addition to its own synchronous 400/422, because
-    REQ-CB-BOOK-001 explicitly requires rejected bookings to be "rejected to an
-    exception queue" — a requirement CB-DISB's rejection path does not carry.
-    CB-REPAY's PaymentUnmatched follows the same pattern as LoanBookingRejected
-    (real-time exception-queue event), because REQ-CB-REPAY-001 requires
-    unmatched payments to be "routed to an exception queue". CB-DELINQ adds two
-    events with different audiences: DelinquencyStatusChanged is CRM-facing
-    (customer-relevant status change), while LoanAccountNonAccrualFlagged is
-    purely a same-service state-change notification — LAS is its own consumer
-    (the field it sets is what CB-ACCR's eligibility exclusion reads), with
-    Batch/EOD also subscribing for visibility. Neither is an "exception," unlike
-    LoanBookingRejected/PaymentUnmatched — both represent expected, correctly
-    functioning delinquency processing, not a failure mode.
-  x-epics: [CB-BOOK, CB-DISB, CB-REPAY, CB-DELINQ]
+    Domain events published by AccountAdapter. Retrofitted to the API/Event
+    Spec Agent's conventions (v0.3.0, BREAKING from v0.2.0): every topic
+    renamed to the "<context>.<entity>.<eventPastTense>" convention with no
+    version suffix (e.g. `loan.account.booked.v1` → `loan.account.booked`;
+    `payment.unmatched.v1` → `payment.match.failed`, a better 3-segment fit;
+    `loan.account.nonaccrual.v1` → `loan.nonaccrual.flagged`); every Money
+    field now the shared {amount, currency} object. Also adds CB-PAYOFF's
+    `loan.account.closed` event in this increment.
+    Note the deliberate asymmetry between CB-DISB and CB-BOOK's rejection
+    handling: CB-DISB's disbursement rejection (REQ-CB-DISB-002) is NOT
+    modeled as an event — surfaced only synchronously as a 422, since the
+    caller is blocking on that result. CB-BOOK's rejection IS modeled as an
+    event (loan.booking.rejected) in addition to its own synchronous 400/422,
+    because REQ-CB-BOOK-001 explicitly requires rejected bookings to be
+    "rejected to an exception queue". `payment.match.failed` follows the same
+    pattern, because REQ-CB-REPAY-001 uses the same explicit "exception queue"
+    language.
+  x-epics: [CB-BOOK, CB-DISB, CB-REPAY, CB-DELINQ, CB-PAYOFF]
   x-req-ids:
     - REQ-CB-BOOK-001
     - REQ-CB-BOOK-002
@@ -37,6 +32,8 @@ info:
     - REQ-CB-REPAY-005
     - REQ-CB-DELINQ-005
     - REQ-CB-DELINQ-006
+    - REQ-CB-PAYOFF-008
+    - REQ-CB-PAYOFF-009
 
 defaultContentType: application/json
 
@@ -47,100 +44,114 @@ servers:
     description: Core Banking domain event backbone
 
 channels:
-  loan.account.booked.v1:
+  loan.account.booked:
     description: >
       Published once a loan account is successfully booked in Approved status.
-      Consumed by CRM (REQ-CB-BOOK-005, interaction log only — no term or GL
-      detail) and Batch/EOD (REQ-CB-BOOK-007, daily approvals-vs-bookings
-      reconciliation).
-      x-consumers: [CRM, BEOD]
+      Consumed by CRMAdapter (REQ-CB-BOOK-005, interaction log only — no term
+      or GL detail) and BatchEodAdapter (REQ-CB-BOOK-007, daily
+      approvals-vs-bookings reconciliation).
+      x-consumers: [CRMAdapter, BatchEodAdapter]
     publish:
       operationId: publishLoanAccountBooked
       summary: A loan account has been successfully booked
       message:
         $ref: '#/components/messages/LoanAccountBooked'
 
-  loan.booking.rejected.v1:
+  loan.booking.rejected:
     description: >
       Published whenever a booking request is rejected — either malformed/missing
       terms (REQ-CB-BOOK-001) or failed party validation (REQ-CB-BOOK-002).
-      Consumed only by Batch/EOD, which is the "exception queue" REQ-CB-BOOK-001
-      requires; not consumed by CRM, since no customer-facing loan exists yet to
-      log an interaction against.
-      x-consumers: [BEOD]
+      Consumed only by BatchEodAdapter; not consumed by CRMAdapter, since no
+      customer-facing loan exists yet to log an interaction against.
+      x-consumers: [BatchEodAdapter]
     publish:
       operationId: publishLoanBookingRejected
       summary: A booking request was rejected before any account was created
       message:
         $ref: '#/components/messages/LoanBookingRejected'
 
-  loan.account.disbursed.v1:
+  loan.account.disbursed:
     description: >
       Published once a disbursement's funding entry (PR-DISB-01) is confirmed
-      posted and the payment has been confirmed executed. Consumed by CRM
-      (REQ-CB-DISB-005, interaction log only — no balance detail) and Batch/EOD
-      (REQ-CB-DISB-006, daily disbursement-vs-posting reconciliation).
-      x-consumers: [CRM, BEOD]
+      posted and the payment has been confirmed executed. Consumed by
+      CRMAdapter (REQ-CB-DISB-005, interaction log only — no balance detail)
+      and BatchEodAdapter (REQ-CB-DISB-006, daily disbursement-vs-posting
+      reconciliation).
+      x-consumers: [CRMAdapter, BatchEodAdapter]
     publish:
       operationId: publishLoanAccountDisbursed
       summary: A loan account has been successfully disbursed
       message:
         $ref: '#/components/messages/LoanAccountDisbursed'
 
-  payment.unmatched.v1:
+  payment.match.failed:
     description: >
-      REQ-CB-REPAY-001. Published when an inbound PaymentReceived cannot be
-      matched to exactly one active loan account — either loanAccountRef was
-      absent/unresolvable (NO_MATCH) or it matched more than one account
-      (AMBIGUOUS_MATCH). Consumed by Batch/EOD as the real-time exception-queue
-      signal REQ-CB-REPAY-001 requires; not consumed by CRM, since no confirmed
-      loan-account association exists to log an interaction against.
-      x-consumers: [BEOD]
+      REQ-CB-REPAY-001. Published when an inbound payment (received via
+      receiveRepaymentNotification) cannot be matched to exactly one active
+      loan account — either loanAccountRef was absent/unresolvable (NO_MATCH)
+      or it matched more than one account (AMBIGUOUS_MATCH). Consumed by
+      BatchEodAdapter as the real-time exception-queue signal REQ-CB-REPAY-001
+      requires; not consumed by CRMAdapter, since no confirmed loan-account
+      association exists to log an interaction against.
+      x-consumers: [BatchEodAdapter]
     publish:
-      operationId: publishPaymentUnmatched
+      operationId: publishPaymentMatchFailed
       summary: An inbound payment could not be matched to exactly one loan account
       message:
-        $ref: '#/components/messages/PaymentUnmatched'
+        $ref: '#/components/messages/PaymentMatchFailed'
 
-  loan.repayment.posted.v1:
+  loan.repayment.posted:
     description: >
       Published once a repayment's waterfall-allocated entry (PR-REPAY-01) is
-      confirmed posted. Consumed by CRM (REQ-CB-REPAY-005, interaction log only
-      — no allocation breakdown or GL detail).
-      x-consumers: [CRM]
+      confirmed posted. Consumed by CRMAdapter (REQ-CB-REPAY-005, interaction
+      log only — no allocation breakdown or GL detail).
+      x-consumers: [CRMAdapter]
     publish:
       operationId: publishLoanRepaymentPosted
       summary: A repayment has been successfully applied and posted
       message:
         $ref: '#/components/messages/LoanRepaymentPosted'
 
-  delinquency.status.changed.v1:
+  delinquency.status.changed:
     description: >
-      REQ-CB-DELINQ-006. Published whenever an account's dpdBucket changes: new
-      delinquency, cure (return to "Current"), or escalation to a worse bucket.
-      Consumed by CRM for collections/contact-history visibility only — no fee
-      amount or GL detail.
-      x-consumers: [CRM]
+      REQ-CB-DELINQ-006. Published whenever an account's dpdBucket changes:
+      new delinquency, cure, or escalation. Consumed by CRMAdapter for
+      collections/contact-history visibility only — no fee amount or GL detail.
+      x-consumers: [CRMAdapter]
     publish:
       operationId: publishDelinquencyStatusChanged
       summary: A loan account's delinquency bucket changed
       message:
         $ref: '#/components/messages/DelinquencyStatusChanged'
 
-  loan.account.nonaccrual.v1:
+  loan.nonaccrual.flagged:
     description: >
       REQ-CB-DELINQ-005. Published whenever LoanAccount.nonAccrualFlag changes
       (set or cleared) as a side effect of the daily delinquency assessment.
-      This is the event form of the same LoanAccount field CB-ACCR's eligibility
-      query reads internally — published for Batch/EOD visibility and audit, not
-      because CB-ACCR requires it as a trigger (CB-ACCR reads current LoanAccount
-      state directly at batch time, same-service, not via this event).
-      x-consumers: [BEOD]
+      Published for BatchEodAdapter visibility and audit, not because the
+      daily accrual batch requires it as a trigger — that batch reads current
+      LoanAccount state directly, same-service, not via this event.
+      x-consumers: [BatchEodAdapter]
     publish:
-      operationId: publishLoanAccountNonAccrualFlagged
+      operationId: publishLoanNonAccrualFlagged
       summary: A loan account's non-accrual flag changed
       message:
-        $ref: '#/components/messages/LoanAccountNonAccrualFlagged'
+        $ref: '#/components/messages/LoanNonAccrualFlagged'
+
+  loan.account.closed:
+    description: >
+      REQ-CB-PAYOFF-006, 008. Published once a loan account transitions to
+      "Closed" status via payoff — which happens only after GLPostingAPI
+      confirms the PR-PAYOFF-01 entry. Consumed by CRMAdapter (REQ-CB-PAYOFF-008,
+      interaction log only — no balance/quote detail) and BatchEodAdapter
+      (REQ-CB-PAYOFF-009, daily zero-balance verification on every account
+      closed that day).
+      x-consumers: [CRMAdapter, BatchEodAdapter]
+    publish:
+      operationId: publishLoanAccountClosed
+      summary: A loan account has been closed via payoff
+      message:
+        $ref: '#/components/messages/LoanAccountClosed'
 
 components:
   messages:
@@ -165,12 +176,12 @@ components:
       payload:
         $ref: '#/components/schemas/LoanAccountDisbursedPayload'
 
-    PaymentUnmatched:
-      name: PaymentUnmatched
-      title: Payment Unmatched
+    PaymentMatchFailed:
+      name: PaymentMatchFailed
+      title: Payment Match Failed
       contentType: application/json
       payload:
-        $ref: '#/components/schemas/PaymentUnmatchedPayload'
+        $ref: '#/components/schemas/PaymentMatchFailedPayload'
 
     LoanRepaymentPosted:
       name: LoanRepaymentPosted
@@ -186,188 +197,131 @@ components:
       payload:
         $ref: '#/components/schemas/DelinquencyStatusChangedPayload'
 
-    LoanAccountNonAccrualFlagged:
-      name: LoanAccountNonAccrualFlagged
-      title: Loan Account Non-Accrual Flagged
+    LoanNonAccrualFlagged:
+      name: LoanNonAccrualFlagged
+      title: Loan Non-Accrual Flagged
       contentType: application/json
       payload:
-        $ref: '#/components/schemas/LoanAccountNonAccrualFlaggedPayload'
+        $ref: '#/components/schemas/LoanNonAccrualFlaggedPayload'
+
+    LoanAccountClosed:
+      name: LoanAccountClosed
+      title: Loan Account Closed
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/LoanAccountClosedPayload'
 
   schemas:
     LoanAccountBookedPayload:
       type: object
-      required:
-        - loanAccountId
-        - approvalReferenceId
-        - partyId
-        - bookedAt
+      required: [loanAccountId, approvalReferenceId, partyId, bookedAt]
       properties:
-        loanAccountId:
-          type: string
-          format: uuid
-        approvalReferenceId:
-          type: string
-          format: uuid
-        partyId:
-          type: string
-          format: uuid
-        bookedAt:
-          type: string
-          format: date-time
+        loanAccountId: { type: string, format: uuid }
+        approvalReferenceId: { type: string, format: uuid }
+        partyId: { type: string, format: uuid }
+        bookedAt: { type: string, format: date-time }
       description: >
-        Deliberately contains no term detail (rate, principal, day-count) and no
-        PII beyond a partyId reference — CRM's subscription must never require
-        term or balance data (see the CRM / Posting Engine separation constraint);
-        BEOD's reconciliation only needs presence/identity, not term values.
+        Deliberately contains no term detail and no PII beyond a partyId
+        reference — CRMAdapter's subscription must never require term or
+        balance data.
 
     LoanBookingRejectedPayload:
       type: object
-      required:
-        - approvalReferenceId
-        - partyId
-        - reasonCode
-        - rejectedAt
+      required: [approvalReferenceId, partyId, reasonCode, rejectedAt]
       properties:
-        approvalReferenceId:
-          type: string
-          format: uuid
-        partyId:
-          type: string
-          format: uuid
+        approvalReferenceId: { type: string, format: uuid }
+        partyId: { type: string, format: uuid }
         reasonCode:
           type: string
           enum: [MALFORMED_TERMS, PARTY_NOT_FOUND, PARTY_BLOCKED, PARTY_CLOSED, KYC_NOT_VERIFIED]
-        rejectedAt:
-          type: string
-          format: date-time
+        rejectedAt: { type: string, format: date-time }
 
     LoanAccountDisbursedPayload:
       type: object
-      required:
-        - loanAccountId
-        - disbursementId
-        - principalAmount
-        - currency
-        - journalEntryId
-        - paymentId
-        - disbursedAt
+      required: [loanAccountId, disbursementId, principalAmount, journalEntryId, instructionId, disbursedAt]
       properties:
-        loanAccountId:
-          type: string
-          format: uuid
-        disbursementId:
-          type: string
-          format: uuid
-        principalAmount:
-          type: number
-        currency:
-          type: string
-          pattern: "^[A-Z]{3}$"
+        loanAccountId: { type: string, format: uuid }
+        disbursementId: { type: string, format: uuid }
+        principalAmount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
         journalEntryId:
           type: string
           format: uuid
-          description: Reference only — GL remains the sole source of truth for the entry itself
-        paymentId:
+          description: Reference only — GLPostingAPI remains the sole source of truth for the entry itself
+        instructionId:
           type: string
           format: uuid
-        disbursedAt:
-          type: string
-          format: date-time
+          description: The PaymentAPI PaymentInstruction ID
+        disbursedAt: { type: string, format: date-time }
       description: >
-        Deliberately contains no PII and no GL account detail — CRM's
-        subscription must never require reading a balance (see the CRM /
-        Posting Engine separation constraint).
+        Deliberately contains no PII and no GL account detail — CRMAdapter's
+        subscription must never require reading a balance.
 
-    PaymentUnmatchedPayload:
+    PaymentMatchFailedPayload:
       type: object
-      required:
-        - paymentReferenceId
-        - amount
-        - currency
-        - reasonCode
-        - unmatchedAt
+      required: [paymentReferenceId, amount, reasonCode, unmatchedAt]
       properties:
-        paymentReferenceId:
-          type: string
+        paymentReferenceId: { type: string }
         loanAccountRefReceived:
           type: ["string", "null"]
-          description: The raw, unresolved reference as received on PaymentReceived, for Ops investigation
-        amount:
-          type: number
-        currency:
-          type: string
-          pattern: "^[A-Z]{3}$"
+          description: The raw, unresolved reference as received, for Ops investigation
+        amount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
         reasonCode:
           type: string
           enum: [NO_MATCH, AMBIGUOUS_MATCH]
-        unmatchedAt:
-          type: string
-          format: date-time
+        unmatchedAt: { type: string, format: date-time }
 
     LoanRepaymentPostedPayload:
       type: object
-      required:
-        - loanAccountId
-        - repaymentId
-        - journalEntryId
-        - postedAt
+      required: [loanAccountId, repaymentId, journalEntryId, postedAt]
       properties:
-        loanAccountId:
-          type: string
-          format: uuid
-        repaymentId:
-          type: string
+        loanAccountId: { type: string, format: uuid }
+        repaymentId: { type: string }
         journalEntryId:
           type: string
           format: uuid
-          description: Reference only — GL remains the sole source of truth for the entry itself
-        postedAt:
-          type: string
-          format: date-time
+          description: Reference only — GLPostingAPI remains the sole source of truth for the entry itself
+        postedAt: { type: string, format: date-time }
       description: >
-        Deliberately contains no allocation breakdown (fee/interest/principal
-        split) and no GL account detail — CRM's subscription must never require
-        balance or allocation data (see the CRM / Posting Engine separation
-        constraint).
+        Deliberately contains no allocation breakdown and no GL account detail
+        — CRMAdapter's subscription must never require balance or allocation
+        data.
 
     DelinquencyStatusChangedPayload:
       type: object
-      required:
-        - loanAccountId
-        - previousDpdBucket
-        - newDpdBucket
-        - changedAt
+      required: [loanAccountId, previousDpdBucket, newDpdBucket, changedAt]
       properties:
-        loanAccountId:
-          type: string
-          format: uuid
+        loanAccountId: { type: string, format: uuid }
         previousDpdBucket:
           type: string
           enum: ["Current", "1-29", "30-59", "60-89", "90+"]
         newDpdBucket:
           type: string
           enum: ["Current", "1-29", "30-59", "60-89", "90+"]
-        changedAt:
-          type: string
-          format: date-time
-      description: >
-        Deliberately contains no fee amount, no balance, and no GL detail — CRM's
-        subscription must never require reading a balance (see the CRM / Posting
-        Engine separation constraint).
+        changedAt: { type: string, format: date-time }
+      description: Deliberately contains no fee amount, no balance, and no GL detail.
 
-    LoanAccountNonAccrualFlaggedPayload:
+    LoanNonAccrualFlaggedPayload:
       type: object
-      required:
-        - loanAccountId
-        - nonAccrualFlag
-        - effectiveDate
+      required: [loanAccountId, nonAccrualFlag, effectiveDate]
       properties:
-        loanAccountId:
-          type: string
-          format: uuid
+        loanAccountId: { type: string, format: uuid }
         nonAccrualFlag:
           type: boolean
           description: true when newly flagged Non-Accrual, false when cured back to accrual-eligible
-        effectiveDate:
+        effectiveDate: { type: string, format: date }
+
+    LoanAccountClosedPayload:
+      type: object
+      required: [loanAccountId, payoffId, journalEntryId, closedAt]
+      properties:
+        loanAccountId: { type: string, format: uuid }
+        payoffId: { type: string }
+        journalEntryId:
           type: string
-          format: date
+          format: uuid
+          description: Reference only — GLPostingAPI remains the sole source of truth for the entry itself
+        closedAt: { type: string, format: date-time }
+      description: >
+        Deliberately contains no balance, quote breakdown, or GL account
+        detail — CRMAdapter's subscription must never require reading a
+        balance.
