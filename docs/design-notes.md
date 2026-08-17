@@ -42,7 +42,7 @@
 
 ### Document Coverage
 
-8 design notes &middot; 49 interaction-sequence steps &middot; 11 posting rules &middot; 33 spec-file changes &middot; 22 domain events &middot; 11 feature flags.
+8 design notes &middot; 49 interaction-sequence steps &middot; 11 posting rules &middot; 43 spec-file changes &middot; 24 domain events &middot; 11 feature flags.
 
 ### Table of Contents
 
@@ -83,6 +83,7 @@
 | File | Purpose |
 |---|---|
 | `specs/openapi/loan-account-subledger.yaml` | POST /loan-accounts:book, GET /loan-accounts/{id} |
+| `specs/openapi/party-cif.yaml` | GET /parties/{partyId} — read dependency for the party validation step |
 | `specs/asyncapi/loan-account-subledger-events.yaml` | channels loan.account.booked, loan.booking.rejected |
 | `specs/schemas/loan-account.schema.json` | shared TermSet/TermVersion/LoanAccount, referenced via $ref |
 | `specs/schemas/party.schema.json` | shared Party object returned by PartyAPI |
@@ -135,9 +136,12 @@
 | File | Purpose |
 |---|---|
 | `specs/openapi/loan-account-subledger.yaml` | POST/GET .../disbursements, POST .../disbursements/{id}:reverse |
+| `specs/openapi/party-cif.yaml` | GET /parties/{partyId} — read dependency for the party validation step |
 | `specs/openapi/gl-posting-engine.yaml` | register PR-DISB-01, PR-DISB-02 |
 | `specs/openapi/payment-execution.yaml` | POST /payment-instructions:disburse, GET /payment-instructions/{id} |
 | `specs/asyncapi/payment-execution-events.yaml` | channels payment.disbursement.confirmed, payment.disbursement.failed |
+| `specs/asyncapi/gl-posting-engine-events.yaml` | shared gl.entry.posted channel, documenting PR-DISB-01/02 |
+| `specs/asyncapi/loan-account-subledger-events.yaml` | channel loan.account.disbursed |
 | `specs/schemas/payment-instruction.schema.json` | shared PaymentInstruction object |
 | `specs/schemas/journal-entry.schema.json` | shared JournalEntry response with runningBalanceAfter |
 
@@ -146,8 +150,8 @@
 | Event | Producer | Consumers |
 |---|---|---|
 | JournalEntryPosted (gl.entry.posted, filtered PR-DISB-*) | GLPostingAdapter | AccountAdapter, BatchEodAdapter |
-| PaymentDisbursementConfirmed / PaymentDisbursementFailed | PaymentAdapter | AccountAdapter |
-| LoanAccountDisbursed | AccountAdapter | CRMAdapter, BatchEodAdapter |
+| PaymentDisbursementConfirmed (payment.disbursement.confirmed) / PaymentDisbursementFailed (payment.disbursement.failed) | PaymentAdapter | AccountAdapter |
+| LoanAccountDisbursed (loan.account.disbursed) | AccountAdapter | CRMAdapter, BatchEodAdapter |
 
 **Feature flags:**
 
@@ -189,6 +193,7 @@
 |---|---|
 | `specs/openapi/loan-account-subledger.yaml` | GET .../accrual-eligible, POST /loan-accounts:accrue (the batch-trigger action the original design note omitted) |
 | `specs/openapi/gl-posting-engine.yaml` | register PR-ACCR-01; metadata field added to PostJournalEntryRequest/JournalEntry for audit context |
+| `specs/asyncapi/gl-posting-engine-events.yaml` | shared gl.entry.posted channel, documenting PR-ACCR-01 and the runningBalanceAfter/metadata additions |
 | `specs/asyncapi/batch-eod-events.yaml` | channel accrual.exception.raised (renamed from accrual.exception.raised.v1) |
 
 **Domain events:**
@@ -242,6 +247,7 @@
 | `specs/openapi/loan-account-subledger.yaml` | POST /repayments:notify (receiveRepaymentNotification — the new authoritative synchronous trigger), GET /repayments/{id}, POST /repayments/{id}:reverse |
 | `specs/openapi/gl-posting-engine.yaml` | register PR-REPAY-01, PR-REPAY-02; Allocation schema (categorized fee/interest/principal split, Money-based) |
 | `specs/asyncapi/loan-account-subledger-events.yaml` | channels payment.match.failed (renamed from payment.unmatched.v1), loan.repayment.posted |
+| `specs/asyncapi/gl-posting-engine-events.yaml` | shared gl.entry.posted channel, documenting PR-REPAY-01/02 — omitted from this epic's original design-note pass, confirmed present via the file's own x-req-ids (REQ-CB-REPAY-003) |
 | `specs/asyncapi/batch-eod-events.yaml` | channel repayment.exception.raised — present in the shipped contract but missing from the original design note's domain-events table; added here to match |
 
 **Domain events:**
@@ -249,6 +255,7 @@
 | Event | Producer | Consumers |
 |---|---|---|
 | PaymentInboundReceived (payment.inbound.received) | PaymentAdapter | BatchEodAdapter (observability only — no longer drives AccountAdapter processing) |
+| JournalEntryPosted (gl.entry.posted, filtered PR-REPAY-01/02) | GLPostingAdapter | BatchEodAdapter — present in the shipped contract but missing from this epic's original domain-events table; added here to match |
 | PaymentMatchFailed (payment.match.failed) | AccountAdapter | BatchEodAdapter |
 | LoanRepaymentPosted (loan.repayment.posted) | AccountAdapter | CRMAdapter |
 | RepaymentExceptionRaised (repayment.exception.raised) | BatchEodAdapter | Ops/Financial-Reporting (human) |
@@ -298,6 +305,7 @@
 | `specs/openapi/loan-account-subledger.yaml` | GET .../past-due, POST /loan-accounts:assess-delinquency (batch trigger the original note omitted), GET/POST /fees/{id}[:waive] |
 | `specs/openapi/gl-posting-engine.yaml` | register PR-DELINQ-01, PR-DELINQ-02; mandatory metadata (waivedBy/reasonCode) enforced for PR-DELINQ-02 |
 | `specs/asyncapi/loan-account-subledger-events.yaml` | channels delinquency.status.changed, loan.nonaccrual.flagged (both renamed, .v1 dropped) |
+| `specs/asyncapi/gl-posting-engine-events.yaml` | shared gl.entry.posted channel, documenting PR-DELINQ-01/02 — omitted from this epic's original design-note pass, confirmed present via the file's own x-req-ids (REQ-CB-DELINQ-002/007/008) |
 | `specs/asyncapi/batch-eod-events.yaml` | channel delinquency.exception.raised — added to match the shipped contract |
 
 **Domain events:**
@@ -306,6 +314,7 @@
 |---|---|---|
 | DelinquencyStatusChanged (delinquency.status.changed) | AccountAdapter | CRMAdapter |
 | LoanNonAccrualFlagged (loan.nonaccrual.flagged) | AccountAdapter | BatchEodAdapter (visibility only — CB-ACCR reads the flag same-service, not via this event) |
+| JournalEntryPosted (gl.entry.posted, filtered PR-DELINQ-01/02) | GLPostingAdapter | BatchEodAdapter — present in the shipped contract but missing from this epic's original domain-events table; added here to match |
 | DelinquencyExceptionRaised (delinquency.exception.raised) | BatchEodAdapter | Ops/Financial-Reporting (human) |
 
 **Feature flags:**
@@ -348,6 +357,7 @@
 |---|---|
 | `specs/openapi/loan-account-subledger.yaml` | GET .../payoff-quote, GET /payoffs/{id}; receiveRepaymentNotification extended with the payoffQuoteId branch (no separate settlement endpoint) |
 | `specs/openapi/gl-posting-engine.yaml` | register PR-PAYOFF-01 |
+| `specs/asyncapi/gl-posting-engine-events.yaml` | shared gl.entry.posted channel, documenting PR-PAYOFF-01 |
 | `specs/asyncapi/loan-account-subledger-events.yaml` | channel loan.account.closed (renamed from loan.account.closed.v1) |
 | `specs/asyncapi/batch-eod-events.yaml` | channel payoff.exception.raised — added to match the shipped contract |
 
@@ -400,6 +410,7 @@
 |---|---|
 | `specs/openapi/loan-account-subledger.yaml` | POST .../chargeoff, GET /chargeoffs/{id}, GET /recoveries/{id}; receiveRepaymentNotification extended with the ChargedOff-status branch |
 | `specs/openapi/gl-posting-engine.yaml` | register PR-CHGOFF-01 (first rule debiting a non-Cash control account), PR-CHGOFF-02; NEW GET /gl-accounts/{code}/balance |
+| `specs/asyncapi/gl-posting-engine-events.yaml` | shared gl.entry.posted channel, documenting PR-CHGOFF-01/02 |
 | `specs/asyncapi/loan-account-subledger-events.yaml` | channel loan.account.chargedoff (renamed from loan.account.chargedoff.v1) |
 | `specs/asyncapi/batch-eod-events.yaml` | channel chargeoff.exception.raised — a fundamentally different aggregation pattern (portfolio-wide amount comparison, not per-date count comparison) than the other three exception channels |
 
@@ -451,6 +462,7 @@
 |---|---|
 | `specs/openapi/loan-account-subledger.yaml` | POST .../modifications, GET /modifications/{id}, GET .../term-versions, GET .../term-versions:effective (split into two operations vs. the original single-endpoint design) |
 | `specs/openapi/gl-posting-engine.yaml` | register PR-MOD-01; NEW Capitalization schema/oneOf branch on PostJournalEntryRequest (3-way exclusive choice with amount/allocation) |
+| `specs/asyncapi/gl-posting-engine-events.yaml` | shared gl.entry.posted channel, documenting PR-MOD-01 (fires only for Branch A) |
 | `specs/asyncapi/loan-account-subledger-events.yaml` | channel loan.terms.modified (renamed from loan.terms.modified.v1) |
 
 **Domain events:**
@@ -505,16 +517,18 @@ Every journal entry this design introduces, across all 8 epics. GL is the only w
 | LoanAccountBooked (loan.account.booked) | CB-BOOK | AccountAdapter | CRMAdapter, BatchEodAdapter |
 | LoanBookingRejected (loan.booking.rejected) | CB-BOOK | AccountAdapter | BatchEodAdapter |
 | JournalEntryPosted (gl.entry.posted, filtered PR-DISB-*) | CB-DISB | GLPostingAdapter | AccountAdapter, BatchEodAdapter |
-| PaymentDisbursementConfirmed / PaymentDisbursementFailed | CB-DISB | PaymentAdapter | AccountAdapter |
-| LoanAccountDisbursed | CB-DISB | AccountAdapter | CRMAdapter, BatchEodAdapter |
+| PaymentDisbursementConfirmed (payment.disbursement.confirmed) / PaymentDisbursementFailed (payment.disbursement.failed) | CB-DISB | PaymentAdapter | AccountAdapter |
+| LoanAccountDisbursed (loan.account.disbursed) | CB-DISB | AccountAdapter | CRMAdapter, BatchEodAdapter |
 | JournalEntryPosted (gl.entry.posted, filtered PR-ACCR-01) | CB-ACCR | GLPostingAdapter | BatchEodAdapter |
 | AccrualExceptionRaised (accrual.exception.raised) | CB-ACCR | BatchEodAdapter | Ops/Financial-Reporting (human, not a module — see x-consumers: [] in the AsyncAPI file) |
 | PaymentInboundReceived (payment.inbound.received) | CB-REPAY | PaymentAdapter | BatchEodAdapter (observability only — no longer drives AccountAdapter processing) |
+| JournalEntryPosted (gl.entry.posted, filtered PR-REPAY-01/02) | CB-REPAY | GLPostingAdapter | BatchEodAdapter — present in the shipped contract but missing from this epic's original domain-events table; added here to match |
 | PaymentMatchFailed (payment.match.failed) | CB-REPAY | AccountAdapter | BatchEodAdapter |
 | LoanRepaymentPosted (loan.repayment.posted) | CB-REPAY | AccountAdapter | CRMAdapter |
 | RepaymentExceptionRaised (repayment.exception.raised) | CB-REPAY | BatchEodAdapter | Ops/Financial-Reporting (human) |
 | DelinquencyStatusChanged (delinquency.status.changed) | CB-DELINQ | AccountAdapter | CRMAdapter |
 | LoanNonAccrualFlagged (loan.nonaccrual.flagged) | CB-DELINQ | AccountAdapter | BatchEodAdapter (visibility only — CB-ACCR reads the flag same-service, not via this event) |
+| JournalEntryPosted (gl.entry.posted, filtered PR-DELINQ-01/02) | CB-DELINQ | GLPostingAdapter | BatchEodAdapter — present in the shipped contract but missing from this epic's original domain-events table; added here to match |
 | DelinquencyExceptionRaised (delinquency.exception.raised) | CB-DELINQ | BatchEodAdapter | Ops/Financial-Reporting (human) |
 | LoanAccountClosed (loan.account.closed) | CB-PAYOFF | AccountAdapter | CRMAdapter, BatchEodAdapter |
 | JournalEntryPosted (gl.entry.posted, filtered PR-PAYOFF-01) | CB-PAYOFF | GLPostingAdapter | AccountAdapter, BatchEodAdapter |
