@@ -1,18 +1,19 @@
 openapi: 3.1.0
 info:
   title: Party / CIF API
-  version: 0.3.0
+  version: 0.4.0
   description: >
-    Owns party (customer) identity, status, and KYC state. Retrofitted to the
-    API/Event Spec Agent's conventions (v0.3.0, breaking from v0.2.0): Party is
-    now a shared JSON Schema object (../schemas/party.schema.json), referenced
-    via $ref rather than declared inline. Defines only the single read path
-    both CB-BOOK (pre-booking validation, REQ-CB-BOOK-002) and CB-DISB
-    (pre-disbursement validation, REQ-CB-DISB-002) depend on. This operation is
-    read-only and never affects a balance, so it carries no Idempotency-Key
-    requirement.
+    Owns party (customer) identity, status, KYC state, identity documents,
+    and deduplication. Retrofitted to the API/Event Spec Agent's conventions:
+    Party/IdentityDocument/DedupMatchExplanation are shared JSON Schema
+    objects (../schemas/party.schema.json), referenced via $ref rather than
+    declared inline. v0.4.0 (BREAKING from v0.3.0) adds the write surface
+    the Party/CIF Codegen Agent's role requires — findOrCreateParty,
+    updateParty, tombstoneParty, and identity-document management — none of
+    which existed before this increment; the prior version was read-only,
+    scoped only to what CB-BOOK/CB-DISB's KYC checks needed.
   x-adapter: PartyAdapter
-  x-epics: [CB-BOOK, CB-DISB]
+  x-epics: [CB-BOOK, CB-DISB, PARTY-CIF]
   x-req-ids:
     - REQ-CB-BOOK-002
     - REQ-CB-DISB-002
@@ -25,6 +26,70 @@ security:
   - serviceAuth: []
 
 paths:
+  /parties:find-or-create:
+    post:
+      operationId: findOrCreateParty
+      summary: Find an existing party by deterministic dedup match, or create a new one
+      description: >
+        The entry point for onboarding a new applicant. Runs the applicant's
+        identity fields (SSN, name, date of birth, email, phone) through a
+        deterministic, rule-based dedup engine (never an ML/probabilistic
+        model) against existing parties. A match at or above the
+        auto-match confidence threshold returns the EXISTING party
+        (matched=true); below threshold, a new party is created
+        (matched=false) — but any candidate considered, matched or not, is
+        persisted to a dedup audit log with its matched fields and
+        confidence score, so a human can review why two applications were
+        or weren't treated as the same customer. Idempotent on the
+        Idempotency-Key header: a retried call with the same key returns
+        the original outcome rather than re-running dedup and potentially
+        creating a second party from a network-retry race.
+      tags: [Party]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FindOrCreatePartyRequest'
+            examples:
+              standard:
+                summary: "Idempotency-Key = a1b2c3d4-1111-4a5b-9c8d-2e3f4a5b6c7d"
+                value:
+                  firstName: "Jordan"
+                  lastName: "Rivera"
+                  dateOfBirth: "1991-04-12"
+                  ssn: "123-45-6789"
+                  email: "jordan.rivera@example.com"
+                  phone: "+15125551234"
+      responses:
+        '201':
+          description: New party created (no sufficiently confident match found)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FindOrCreatePartyResponse'
+        '200':
+          description: Existing party matched (or idempotent replay)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FindOrCreatePartyResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /parties/{partyId}:
     get:
       operationId: getParty
@@ -34,15 +99,12 @@ paths:
         REQ-CB-BOOK-002 (immediately before booking) and REQ-CB-DISB-002
         (immediately before posting a disbursement, to confirm the party is
         still Active and KYC is still Verified at the moment of funding —
-        deliberately re-checked rather than trusted from booking time).
+        deliberately re-checked rather than trusted from booking time). A
+        tombstoned party is still returned (never deleted) — callers must
+        check the `tombstoned` field explicitly.
       tags: [Party]
       parameters:
-        - name: partyId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: '#/components/parameters/PartyId'
       responses:
         '200':
           description: Current party state
@@ -61,7 +123,214 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+    patch:
+      operationId: updateParty
+      summary: Update a party's mutable contact fields
+      description: >
+        Updates email/phone/address-class fields only — identity fields
+        (name, dateOfBirth, ssn) are immutable once a party exists; a
+        genuine identity correction is a data-quality exception handled
+        outside this endpoint, not a silent field edit, since it could
+        invalidate a prior dedup decision. Publishes party.updated with the
+        list of changed field NAMES (never values). Idempotent on the
+        Idempotency-Key header.
+      tags: [Party]
+      parameters:
+        - $ref: '#/components/parameters/PartyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePartyRequest'
+      responses:
+        '200':
+          description: Party updated
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/party.schema.json#/$defs/Party'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Party is tombstoned, or Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /parties/{partyId}:tombstone:
+    post:
+      operationId: tombstoneParty
+      summary: Soft-delete a party (tombstone) — never a row deletion
+      description: >
+        Records a reason and actor and flips `tombstoned` to true. The
+        party row, and every identity document and dedup audit entry
+        attached to it, remain in place and queryable — this system
+        carries the same 7-year audit retention as the ledger, and a
+        party can never be truly deleted. A subsequent
+        findOrCreateParty call with matching identity fields against a
+        tombstoned party still matches it (re-application after tombstone
+        is a real, tested case — see the dedup engine's unit tests) rather
+        than silently creating a duplicate.
+      tags: [Party]
+      parameters:
+        - $ref: '#/components/parameters/PartyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TombstonePartyRequest'
+      responses:
+        '200':
+          description: Party tombstoned (or already tombstoned — idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/party.schema.json#/$defs/Party'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /parties/{partyId}/documents:
+    get:
+      operationId: listIdentityDocuments
+      summary: Retrieve the full, unfiltered identity-document version history for a party
+      description: >
+        Every version of every document type ever attached to this party —
+        never filtered to "current only" by default, since a replaced
+        document's prior version is retained, not deleted (same immutable-
+        versioning discipline as TermVersion elsewhere in this system).
+      tags: [Party]
+      parameters:
+        - $ref: '#/components/parameters/PartyId'
+      responses:
+        '200':
+          description: Full identity-document history, all types and versions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '../schemas/party.schema.json#/$defs/IdentityDocument'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      operationId: addIdentityDocument
+      summary: Attach a new identity document, or a new version of an existing one
+      description: >
+        If a document of the same documentType already exists for this
+        party, this creates a NEW version (version = prior max + 1,
+        supersedesDocumentId = the prior version's ID) — it never edits or
+        replaces the prior row. Idempotent on the Idempotency-Key header.
+      tags: [Party]
+      parameters:
+        - $ref: '#/components/parameters/PartyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddIdentityDocumentRequest'
+      responses:
+        '201':
+          description: Document version recorded
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/party.schema.json#/$defs/IdentityDocument'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /parties/{partyId}/documents/{documentId}:
+    get:
+      operationId: getIdentityDocument
+      summary: Retrieve one specific identity-document version
+      tags: [Party]
+      parameters:
+        - $ref: '#/components/parameters/PartyId'
+        - name: documentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The document version
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/party.schema.json#/$defs/IdentityDocument'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
+  parameters:
+    PartyId:
+      name: partyId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-supplied retry-safety token. Value convention documented per operation.
+      schema:
+        type: string
+
   securitySchemes:
     serviceAuth:
       type: oauth2
@@ -70,7 +339,8 @@ components:
         clientCredentials:
           tokenUrl: https://auth.internal.core-banking.example/oauth2/token
           scopes:
-            party:read: Read party status and KYC state
+            party:read: Read party status, KYC state, and identity documents
+            party:write: Find-or-create, update, and tombstone parties; attach identity documents
 
   responses:
     BadRequest:
@@ -93,18 +363,61 @@ components:
       content:
         application/json:
           schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
-    Conflict:
-      description: Idempotency-Key reused with a materially different payload
-      content:
-        application/json:
-          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
-    UnprocessableEntity:
-      description: Request well-formed but semantically invalid
-      content:
-        application/json:
-          schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
     InternalServerError:
       description: Unexpected server error
       content:
         application/json:
           schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+
+  schemas:
+    FindOrCreatePartyRequest:
+      type: object
+      required: [firstName, lastName, dateOfBirth, ssn]
+      properties:
+        firstName: { type: string }
+        lastName: { type: string }
+        dateOfBirth: { type: string, format: date }
+        ssn:
+          type: string
+          description: >-
+            Full SSN, write-only — accepted here, encrypted at rest,
+            never returned in any response (see Party.ssnLast4).
+          pattern: "^\\d{3}-?\\d{2}-?\\d{4}$"
+        email: { type: ["string", "null"], format: email }
+        phone: { type: ["string", "null"] }
+
+    UpdatePartyRequest:
+      type: object
+      description: All fields optional — only supplied fields are changed.
+      properties:
+        email: { type: ["string", "null"], format: email }
+        phone: { type: ["string", "null"] }
+
+    TombstonePartyRequest:
+      type: object
+      required: [reason, actor]
+      properties:
+        reason: { type: string }
+        actor: { type: string, description: Identity of the requesting operator/system. }
+
+    AddIdentityDocumentRequest:
+      type: object
+      required: [documentType, documentNumber, issuingAuthority]
+      properties:
+        documentType:
+          type: string
+          enum: [DRIVERS_LICENSE, PASSPORT, STATE_ID, OTHER_GOVERNMENT_ID]
+        documentNumber:
+          type: string
+          description: Full document number, write-only — encrypted at rest, never returned (see IdentityDocument.documentNumberLast4).
+        issuingAuthority: { type: string }
+        expiresAt: { type: ["string", "null"], format: date }
+
+    FindOrCreatePartyResponse:
+      type: object
+      required: [party, matchExplanation]
+      properties:
+        party:
+          $ref: '../schemas/party.schema.json#/$defs/Party'
+        matchExplanation:
+          $ref: '../schemas/party.schema.json#/$defs/DedupMatchExplanation'

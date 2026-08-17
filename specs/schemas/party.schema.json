@@ -5,7 +5,7 @@
   "$defs": {
     "Party": {
       "type": "object",
-      "required": ["partyId", "status", "kycStatus", "updatedAt"],
+      "required": ["partyId", "status", "kycStatus", "tombstoned", "createdAt", "updatedAt"],
       "properties": {
         "partyId": { "type": "string", "format": "uuid" },
         "status": {
@@ -21,7 +21,90 @@
           "x-pii": true,
           "description": "Present only on operations that explicitly need it for human display (e.g. CRM). Omitted from every balance/posting-adjacent payload."
         },
+        "firstName": { "type": "string", "x-pii": true },
+        "lastName": { "type": "string", "x-pii": true },
+        "dateOfBirth": { "type": "string", "format": "date", "x-pii": true },
+        "email": { "type": ["string", "null"], "format": "email", "x-pii": true },
+        "phone": { "type": ["string", "null"], "x-pii": true },
+        "ssnLast4": {
+          "type": "string",
+          "pattern": "^[0-9]{4}$",
+          "x-pii": true,
+          "description": "Masked — last 4 digits only. The full SSN is accepted on write (FindOrCreatePartyRequest) but is NEVER echoed back in any response, at any field, under any circumstance — defense in depth beyond field-level encryption at rest: even a fully authorized, correctly-scoped caller only ever sees the mask."
+        },
+        "tombstoned": {
+          "type": "boolean",
+          "description": "Party records are never deleted (7-year audit retention). true once soft-deleted; the record and its full history remain queryable."
+        },
+        "tombstoneReason": { "type": ["string", "null"] },
+        "tombstonedBy": { "type": ["string", "null"] },
+        "tombstonedAt": { "type": ["string", "null"], "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+
+    "IdentityDocument": {
+      "type": "object",
+      "required": ["documentId", "partyId", "documentType", "version", "supersedesDocumentId", "documentNumberLast4", "issuingAuthority", "expiresAt", "createdAt"],
+      "properties": {
+        "documentId": { "type": "string", "format": "uuid" },
+        "partyId": { "type": "string", "format": "uuid" },
+        "documentType": {
+          "type": "string",
+          "enum": ["DRIVERS_LICENSE", "PASSPORT", "STATE_ID", "OTHER_GOVERNMENT_ID"]
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1 for the first document of this documentType on this party; incremented on each replacement. Immutable and versioned like TermVersion elsewhere in this system — a replacement never edits or deletes a prior version."
+        },
+        "supersedesDocumentId": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "The documentId this version replaces, if any. Null for version 1."
+        },
+        "documentNumberLast4": {
+          "type": "string",
+          "x-pii": true,
+          "description": "Masked, same defense-in-depth principle as Party.ssnLast4 — the full document number is accepted on write and encrypted at rest, never echoed back."
+        },
+        "issuingAuthority": { "type": "string" },
+        "expiresAt": { "type": ["string", "null"], "format": "date" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+
+    "DedupMatchExplanation": {
+      "type": "object",
+      "required": ["matched", "matchedPartyId", "confidence", "matchedFields", "ruleId"],
+      "properties": {
+        "matched": {
+          "type": "boolean",
+          "description": "true if this find-or-create call resolved to an EXISTING party rather than creating a new one."
+        },
+        "matchedPartyId": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "Set only when matched=true."
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Deterministic, rule-derived score — never an ML/probabilistic model output. See the dedup engine's named rule table for exactly how each value is produced."
+        },
+        "matchedFields": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Which input fields corroborated the match, e.g. [\"ssn\", \"dateOfBirth\"] — field NAMES only, never the field VALUES (avoids leaking PII into an audit/explanation payload)."
+        },
+        "ruleId": {
+          "type": "string",
+          "description": "The specific named dedup rule that fired, e.g. SSN_EXACT, NAME_DOB_EXACT, EMAIL_NAME_CORROBORATED — makes every decision traceable to one auditable rule, not a black box."
+        }
       },
       "additionalProperties": false
     }

@@ -1,0 +1,116 @@
+asyncapi: 2.6.0
+info:
+  title: Party / CIF Events
+  version: 0.1.0
+  description: >
+    Domain events published by PartyAdapter. First increment — Party/CIF had
+    no async contract before this (the module only ever exposed a read
+    endpoint). Every state change (create, update, tombstone) publishes its
+    corresponding event transactionally with the database write via the
+    outbox pattern — never a best-effort publish after the fact, and never
+    a publish that can succeed while the write fails or vice versa.
+    Deliberately, no event payload here carries any PII field: create/update
+    events carry partyId and non-PII status metadata only; changed-field
+    lists carry field NAMES, never VALUES.
+  x-adapter: PartyAdapter
+
+defaultContentType: application/json
+
+servers:
+  production:
+    url: events.internal.core-banking.example:9092
+    protocol: kafka
+    description: Core Banking domain event backbone
+
+channels:
+  party.created:
+    description: >
+      Published once, transactionally, when findOrCreateParty results in a
+      NEW party (matched=false). Not published on a matched (existing-party)
+      outcome — that is not a creation event.
+      x-consumers: [AccountAdapter, CRMAdapter]
+    publish:
+      operationId: publishPartyCreated
+      summary: A new party was created
+      message:
+        $ref: '#/components/messages/PartyCreated'
+
+  party.updated:
+    description: >
+      Published once, transactionally, on every successful updateParty call.
+      Carries the list of changed field NAMES only — never the new or old
+      values — so consumers know WHAT changed without this event itself
+      becoming a PII leak vector.
+      x-consumers: [CRMAdapter]
+    publish:
+      operationId: publishPartyUpdated
+      summary: A party's mutable contact fields were updated
+      message:
+        $ref: '#/components/messages/PartyUpdated'
+
+  party.tombstoned:
+    description: >
+      Published once, transactionally, when a party is soft-deleted.
+      reason/actor describe the tombstone ACTION itself (operational
+      metadata), not anything about the customer, so they are not treated
+      as PII here.
+      x-consumers: [AccountAdapter, CRMAdapter, BatchEodAdapter]
+    publish:
+      operationId: publishPartyTombstoned
+      summary: A party was tombstoned (soft-deleted)
+      message:
+        $ref: '#/components/messages/PartyTombstoned'
+
+components:
+  messages:
+    PartyCreated:
+      name: PartyCreated
+      title: Party Created
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/PartyCreatedPayload'
+
+    PartyUpdated:
+      name: PartyUpdated
+      title: Party Updated
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/PartyUpdatedPayload'
+
+    PartyTombstoned:
+      name: PartyTombstoned
+      title: Party Tombstoned
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/PartyTombstonedPayload'
+
+  schemas:
+    PartyCreatedPayload:
+      type: object
+      required: [partyId, status, kycStatus, createdAt]
+      properties:
+        partyId: { type: string, format: uuid }
+        status: { type: string, enum: [Active, Blocked, Closed, Inactive] }
+        kycStatus: { type: string, enum: [Verified, Unverified, Expired] }
+        createdAt: { type: string, format: date-time }
+      description: Deliberately contains no PII — no name, SSN, email, or phone.
+
+    PartyUpdatedPayload:
+      type: object
+      required: [partyId, changedFields, updatedAt]
+      properties:
+        partyId: { type: string, format: uuid }
+        changedFields:
+          type: array
+          items: { type: string }
+          description: Field NAMES only, e.g. ["email", "phone"] — never the values.
+        updatedAt: { type: string, format: date-time }
+
+    PartyTombstonedPayload:
+      type: object
+      required: [partyId, reason, actor, tombstonedAt]
+      properties:
+        partyId: { type: string, format: uuid }
+        reason: { type: string }
+        actor: { type: string }
+        tombstonedAt: { type: string, format: date-time }
