@@ -11,14 +11,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	kafkago "github.com/segmentio/kafka-go"
 
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/api"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/auth"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/pii"
+	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/relay"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/service"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/store/postgres"
 )
@@ -84,6 +87,36 @@ func run() error {
 	svc := service.New(st)
 	srv := api.NewServer(svc, st, validator)
 
+	// PARTY_SERVICE_KAFKA_BROKERS is a comma-separated broker list. The
+	// relay (internal/relay) reads unpublished rows from the outbox
+	// table this service's own writes populate and delivers them here —
+	// see internal/outbox's package doc comment for why this is a
+	// separate, independently-polling path rather than a synchronous
+	// publish inside the request handler.
+	kafkaBrokers := os.Getenv("PARTY_SERVICE_KAFKA_BROKERS")
+	if kafkaBrokers == "" {
+		return fmt.Errorf("PARTY_SERVICE_KAFKA_BROKERS is required")
+	}
+	kafkaWriter := &kafkago.Writer{
+		Addr:         kafkago.TCP(strings.Split(kafkaBrokers, ",")...),
+		Balancer:     &kafkago.LeastBytes{},
+		RequiredAcks: kafkago.RequireAll,
+		// Topic is deliberately left unset -- every outbox entry sets
+		// its own Topic per message (party.created vs. party.updated vs.
+		// party.tombstoned all share this one Writer); kafka-go rejects
+		// a Writer that has both a fixed Topic and per-message topics.
+	}
+	defer kafkaWriter.Close()
+	publisher := relay.NewPublisher(st, kafkaWriter, 100)
+
+	pollInterval := 2 * time.Second
+	if v := os.Getenv("PARTY_SERVICE_OUTBOX_POLL_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			pollInterval = d
+		}
+	}
+	go runOutboxRelay(ctx, publisher, pollInterval)
+
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           srv.Routes(),
@@ -105,5 +138,30 @@ func run() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		return httpServer.Shutdown(shutdownCtx)
+	}
+}
+
+// runOutboxRelay polls the outbox on a fixed interval until ctx is
+// canceled. A publish error is logged, never fatal — the outbox pattern
+// exists precisely so a transient Kafka outage doesn't affect the
+// request path; the next poll retries whatever wasn't published,
+// including anything skipped by this failed attempt.
+func runOutboxRelay(ctx context.Context, publisher *relay.Publisher, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := publisher.PublishUnpublished(ctx)
+			if err != nil {
+				log.Printf("party-service: outbox relay error: %v", err)
+				continue
+			}
+			if n > 0 {
+				log.Printf("party-service: outbox relay published %d event(s)", n)
+			}
+		}
 	}
 }

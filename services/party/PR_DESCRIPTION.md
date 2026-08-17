@@ -77,10 +77,6 @@ read-only):**
 
 ## What's explicitly out of scope
 
-- A concrete Kafka-backed `outbox.Publisher` (the relay that reads
-  unpublished outbox rows and actually delivers them) — the interface and
-  an in-memory test fake exist; a production implementation is a
-  deployment-time concern, not this change.
 - KMS integration for the encryption key — `cmd/party-service/main.go`
   takes an already-resolved 32-byte key from an environment variable by
   design; resolving it from a KMS is upstream of this process.
@@ -254,3 +250,56 @@ This is now fixed:
   `PARTY_SERVICE_JWKS_URL` (required), `PARTY_SERVICE_TOKEN_ISSUER` and
   `PARTY_SERVICE_TOKEN_AUDIENCE` (both optional but recommended in
   production).
+
+## Follow-up: Kafka outbox publisher (added after the auth follow-up)
+
+`internal/outbox.Publisher` previously had no concrete implementation —
+domain events were written to the `outbox` table transactionally with
+every business write, but nothing ever delivered them anywhere. That's
+now wired up:
+
+- `internal/outbox.Reader` (new interface) — the minimal read/mark
+  contract a relay needs from the outbox table (`ListUnpublished`,
+  `MarkPublished`). Declared in `internal/outbox`, not `internal/store`,
+  specifically to avoid an import cycle (`internal/store` already imports
+  `internal/outbox` for `Inserter`).
+- `internal/store/postgres` — `Store.ListUnpublished` /
+  `Store.MarkPublished` satisfy `outbox.Reader` structurally; both run
+  outside any request-path transaction, since the relay is an
+  independently-polling process, not part of the write path.
+- `internal/relay` (new package, `segmentio/kafka-go` — pure Go, no
+  cgo/librdkafka dependency) — `Publisher.PublishUnpublished` lists a
+  batch of unpublished rows, writes each to its own Kafka topic (every
+  outbox entry carries its own `Topic`; a single `kafka-go` `Writer` with
+  no fixed topic handles all three event types), and only marks a row
+  published after the Kafka write actually succeeds. A write failure
+  marks nothing, so the same rows are retried on the next poll — an
+  intentional at-least-once contract, consistent with every consumer of
+  these topics elsewhere in the platform already being expected to be
+  idempotent (see `internal/outbox`'s package doc comment).
+- `cmd/party-service/main.go` — wires a real `*kafkago.Writer` from
+  `PARTY_SERVICE_KAFKA_BROKERS` (required, comma-separated) and runs the
+  relay on a ticker (`PARTY_SERVICE_OUTBOX_POLL_INTERVAL`, default 2s) in
+  a background goroutine that shuts down with the rest of the process. A
+  publish error is logged, never fatal — a transient Kafka outage must
+  not take down the HTTP service; the outbox pattern exists specifically
+  so business writes stay durable and correct regardless of the broker's
+  momentary availability.
+
+5 new tests in `internal/relay/kafka_publisher_test.go`, against a fake
+`outbox.Reader` and a fake Kafka `Writer`:
+- `TestPublishUnpublished_NoEntries_NoOp` — an empty outbox writes
+  nothing to Kafka.
+- `TestPublishUnpublished_WritesEachEntryToItsOwnTopic_ThenMarksPublished`
+  — each entry is written to its own topic, and only marked published
+  after the write.
+- `TestPublishUnpublished_WriteFails_NothingMarkedPublished` — a Kafka
+  write failure marks nothing published, so the same entries retry.
+- `TestPublishUnpublished_MarkPublishedFails_ErrorSurfaced` — a failure
+  marking published (after a successful Kafka write) surfaces as an
+  error, distinctly from a publish failure.
+- `TestPublishUnpublished_RespectsBatchSize` — a poll never fetches more
+  than its configured batch size.
+
+**Verification:** `go build ./...`, `go vet ./...`, `gofmt -l .` (clean),
+and `go test ./...` all pass — 62/62 tests total.

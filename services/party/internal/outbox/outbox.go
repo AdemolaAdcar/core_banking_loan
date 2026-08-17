@@ -56,11 +56,24 @@ type Inserter interface {
 // in this system is already expected to be idempotent, same as every
 // other event in the platform.
 //
-// This package defines the contract only. A concrete Kafka-backed
-// implementation is a deployment-time concern outside this change's
-// scope — see InMemoryPublisher below for the fake used in tests.
+// See internal/relay for the concrete Kafka-backed implementation (built
+// on Reader below) and InMemoryPublisher here for the fake used in
+// service-layer tests that don't care about relay mechanics at all.
 type Publisher interface {
 	PublishUnpublished(ctx context.Context) (published int, err error)
+}
+
+// Reader is the minimal capability a Publisher needs from the outbox
+// table: fetch a batch of not-yet-published rows, and mark a batch
+// published once they've actually been handed to the broker. Deliberately
+// declared here (referencing only Entry, not internal/store) rather than
+// on store.Store, so this package never has to import internal/store —
+// internal/store already imports this package for Inserter, and a
+// reverse import would be a cycle. internal/store/postgres.Store
+// satisfies this interface structurally, without declaring so.
+type Reader interface {
+	ListUnpublished(ctx context.Context, limit int) ([]Entry, error)
+	MarkPublished(ctx context.Context, ids []string) error
 }
 
 // InMemoryPublisher is a test/local-dev fake: it publishes by appending

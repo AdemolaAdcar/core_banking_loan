@@ -29,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/domain"
+	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/outbox"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/pii"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/store"
 )
@@ -304,6 +305,43 @@ func (s *Store) MaxDocumentVersion(ctx context.Context, partyID string, docType 
 		return 0, nil, fmt.Errorf("postgres: querying max document version: %w", err)
 	}
 	return version, &id, nil
+}
+
+// ListUnpublished and MarkPublished implement outbox.Reader — the
+// interface internal/relay's Kafka publisher polls against. They run
+// outside any request-path transaction: the relay is a separate
+// process/goroutine from the request path that wrote these rows (see
+// internal/relay's package doc comment for the at-least-once delivery
+// tradeoff that implies).
+func (s *Store) ListUnpublished(ctx context.Context, limit int) ([]outbox.Entry, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT id, topic, payload_json, created_at FROM outbox WHERE published_at IS NULL ORDER BY created_at ASC LIMIT $1",
+		limit)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: querying unpublished outbox entries: %w", err)
+	}
+	defer rows.Close()
+
+	var out []outbox.Entry
+	for rows.Next() {
+		var e outbox.Entry
+		if err := rows.Scan(&e.ID, &e.Topic, &e.PayloadJSON, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("postgres: scanning outbox entry: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) MarkPublished(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, "UPDATE outbox SET published_at = now() WHERE id = ANY($1)", ids)
+	if err != nil {
+		return fmt.Errorf("postgres: marking outbox entries published: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) GetIdempotentResponse(ctx context.Context, idempotencyKey string) (bool, []byte, error) {
