@@ -171,8 +171,9 @@ highest-risk piece of this change:
   independent across different document types, and the prior version is
   never removed from the fake store.
 
-**`internal/api/handlers_test.go` (8 tests)**, against an in-memory fake
-`store.Store` (`internal/api/fake_store_test.go`), using `net/http/httptest`:
+**`internal/api/handlers_test.go` (12 tests)**, against an in-memory fake
+`store.Store` (`internal/api/fake_store_test.go`) and a fake `auth.Validator`
+(`internal/api/fake_auth_test.go`), using `net/http/httptest`:
 - `TestFindOrCreateParty_MissingIdempotencyKey_400` — the required header
   is actually enforced.
 - `TestFindOrCreateParty_CreatesParty_201` — the create path returns 201
@@ -189,11 +190,67 @@ highest-risk piece of this change:
   layer surfaces the service's idempotent-tombstone behavior correctly.
 - `TestAddIdentityDocument_SecondVersionSupersedesFirst` — versioning is
   correct end-to-end through the HTTP layer.
+- `TestAuth_MissingAuthorizationHeader_401` — every route requires a
+  bearer token; there is no unauthenticated route.
+- `TestAuth_InvalidToken_401` — a token the validator rejects is refused,
+  not passed through.
+- `TestAuth_ReadScopeCannotFindOrCreate_403`,
+  `TestAuth_WriteScopeCannotGetParty_403` — `party:read` and `party:write`
+  are enforced per-operation, exactly as `party-cif.yaml`'s
+  `serviceAuth` scheme declares — a read-scoped token cannot call a
+  write operation and vice versa.
+
+**`internal/auth/jwks_test.go` (8 tests)** — the JWKS/RS256 token
+validator itself, using real RSA keypairs and a real `httptest.Server`
+JWKS endpoint (not mocked at the JWT-library level):
+- `TestJWKSValidator_ValidToken_ReturnsClaims` — a correctly signed,
+  unexpired token validates and its scopes are extracted.
+- `TestJWKSValidator_ExpiredToken_Rejected` — an expired token is refused.
+- `TestJWKSValidator_WrongSigningKey_Rejected` — a token signed with a
+  key different from the one the JWKS endpoint advertises under that
+  `kid` fails signature verification.
+- `TestJWKSValidator_HS256AlgorithmConfusion_Rejected` — the classic
+  RS256/HS256 algorithm-confusion attack (HMAC-signing a forged token
+  using the public RSA key's bytes as the HMAC secret) is rejected
+  outright, not validated against the RSA key.
+- `TestJWKSValidator_WrongIssuer_Rejected` — issuer mismatch is caught
+  when an issuer is configured.
+- `TestJWKSValidator_UnknownKeyID_TriggersRefreshThenFails` — an unknown
+  `kid` triggers exactly one JWKS re-fetch (the mechanism that lets key
+  rotation work without a background refresh goroutine) and still fails
+  cleanly if the key genuinely doesn't exist.
+- `TestClaims_HasScope`, `TestTokenClaims_ScopesFallsBackToScpArray` —
+  scope-checking and the `scope`/`scp` claim dual-support.
 
 **Verification:** `go build ./...`, `go vet ./...`, and `gofmt -l .` (clean)
-all pass; `go test ./...` — 45/45 tests passing across
-`internal/domain`, `internal/pii`, `internal/service`, and `internal/api`.
-`internal/store/postgres` and `cmd/party-service` have no unit tests — they
-require a live Postgres instance to exercise meaningfully; that is
-integration-test territory, not unit-test territory, and is out of scope
-for this change.
+all pass; `go test ./...` — 57/57 tests passing across
+`internal/domain`, `internal/pii`, `internal/service`, `internal/api`, and
+`internal/auth`. `internal/store/postgres` and `cmd/party-service` have no
+unit tests — they require a live Postgres instance (and, for `main.go`, a
+live JWKS endpoint) to exercise meaningfully; that is integration-test
+territory, not unit-test territory, and is out of scope for this change.
+
+## Follow-up: auth middleware (added after initial review)
+
+The first pass of this service had no authentication or authorization
+enforcement at all, despite `party-cif.yaml` declaring a global
+`serviceAuth` OAuth2 security scheme with `party:read`/`party:write`
+scopes — every endpoint was reachable by anyone who could route to it.
+This is now fixed:
+
+- `internal/auth` — `Validator` interface (mirrors the `pii.Encryptor`
+  pattern: a narrow interface with a real implementation and a
+  swappable test double); `JWKSValidator` validates RS256-signed access
+  tokens against a JSON Web Key Set fetched from the internal
+  authorization server, entirely locally per request (no callback to
+  the auth server on the request path). Explicitly rejects non-RS256
+  tokens before touching the key cache — defense in depth against
+  algorithm-confusion attacks — and optionally checks issuer/audience.
+- `internal/api/auth_middleware.go` — `withScope` wraps every route in
+  `Routes()` with the exact scope that operation declares in the spec;
+  missing/invalid token → 401, valid token missing the required scope →
+  403.
+- `cmd/party-service/main.go` — wires a `JWKSValidator` from
+  `PARTY_SERVICE_JWKS_URL` (required), `PARTY_SERVICE_TOKEN_ISSUER` and
+  `PARTY_SERVICE_TOKEN_AUDIENCE` (both optional but recommended in
+  production).

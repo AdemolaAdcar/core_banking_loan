@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/api"
+	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/auth"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/pii"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/service"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/store/postgres"
@@ -68,9 +69,20 @@ func run() error {
 		return fmt.Errorf("pinging database: %w", err)
 	}
 
+	// PARTY_SERVICE_JWKS_URL points at the internal OAuth2 authorization
+	// server's key set (see party-cif.yaml's serviceAuth.tokenUrl for the
+	// same server's token endpoint). Issuer/audience are optional but
+	// strongly recommended in production — leaving either empty skips
+	// that specific check.
+	jwksURL := os.Getenv("PARTY_SERVICE_JWKS_URL")
+	if jwksURL == "" {
+		return fmt.Errorf("PARTY_SERVICE_JWKS_URL is required")
+	}
+	validator := auth.NewJWKSValidator(jwksURL, os.Getenv("PARTY_SERVICE_TOKEN_ISSUER"), os.Getenv("PARTY_SERVICE_TOKEN_AUDIENCE"))
+
 	st := postgres.New(pool, encryptor)
 	svc := service.New(st)
-	srv := api.NewServer(svc, st)
+	srv := api.NewServer(svc, st, validator)
 
 	httpServer := &http.Server{
 		Addr:              addr,

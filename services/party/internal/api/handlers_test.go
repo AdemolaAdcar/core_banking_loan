@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,12 +15,17 @@ import (
 func newTestServer() (*Server, *fakeStore) {
 	fs := newFakeStore()
 	svc := service.New(fs)
-	return NewServer(svc, fs), fs
+	return NewServer(svc, fs, allowAllValidator()), fs
 }
 
+// doRequest attaches a bearer token by default (accepted unconditionally
+// by fakeValidator/allowAllValidator) so tests unrelated to auth aren't
+// forced to think about it — auth-specific tests below construct their
+// own request directly instead of using this helper.
 func doRequest(h http.Handler, method, path string, body []byte, idempotencyKey string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
 	if idempotencyKey != "" {
 		req.Header.Set("Idempotency-Key", idempotencyKey)
 	}
@@ -160,3 +166,59 @@ func TestAddIdentityDocument_SecondVersionSupersedesFirst(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+func TestAuth_MissingAuthorizationHeader_401(t *testing.T) {
+	fs := newFakeStore()
+	srv := NewServer(service.New(fs), fs, allowAllValidator())
+	req := httptest.NewRequest(http.MethodGet, "/parties/p1", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no Authorization header, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAuth_InvalidToken_401(t *testing.T) {
+	fs := newFakeStore()
+	srv := NewServer(service.New(fs), fs, &fakeValidator{err: errInvalidTokenForTest})
+	req := httptest.NewRequest(http.MethodGet, "/parties/p1", nil)
+	req.Header.Set("Authorization", "Bearer whatever")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for a token the validator rejects, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAuth_ReadScopeCannotFindOrCreate_403(t *testing.T) {
+	fs := newFakeStore()
+	readOnly := &fakeValidator{grantedScopes: []string{"party:read"}}
+	srv := NewServer(service.New(fs), fs, readOnly)
+
+	body, _ := json.Marshal(findOrCreatePartyRequest{FirstName: "Jane", LastName: "Doe", DateOfBirth: "1990-01-01", SSN: "123-45-6789"})
+	req := httptest.NewRequest(http.MethodPost, "/parties:find-or-create", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer whatever")
+	req.Header.Set("Idempotency-Key", "key-1")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a party:read-only token calling a party:write operation, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAuth_WriteScopeCannotGetParty_403(t *testing.T) {
+	fs := newFakeStore()
+	fs.parties["p1"] = domain.Party{ID: "p1"}
+	writeOnly := &fakeValidator{grantedScopes: []string{"party:write"}}
+	srv := NewServer(service.New(fs), fs, writeOnly)
+
+	req := httptest.NewRequest(http.MethodGet, "/parties/p1", nil)
+	req.Header.Set("Authorization", "Bearer whatever")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a party:write-only token calling a party:read operation, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+var errInvalidTokenForTest = errors.New("simulated invalid token")

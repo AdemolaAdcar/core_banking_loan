@@ -8,34 +8,38 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/auth"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/domain"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/service"
 	"github.com/AdemolaAdcar/core_banking_loan/services/party/internal/store"
 )
 
-// Server wires the HTTP transport to internal/service (business writes)
-// and internal/store.Store (read-only lookups — getParty,
+// Server wires the HTTP transport to internal/service (business writes),
+// internal/store.Store (read-only lookups — getParty,
 // listIdentityDocuments, getIdentityDocument have no business logic of
 // their own, so they call the store directly rather than through a
-// pass-through service method).
+// pass-through service method), and internal/auth (every route requires
+// a valid bearer token carrying the operation's required scope; see
+// party-cif.yaml's serviceAuth security scheme).
 type Server struct {
-	svc   *service.Service
-	store store.Store
+	svc       *service.Service
+	store     store.Store
+	validator auth.Validator
 }
 
-func NewServer(svc *service.Service, st store.Store) *Server {
-	return &Server{svc: svc, store: st}
+func NewServer(svc *service.Service, st store.Store, validator auth.Validator) *Server {
+	return &Server{svc: svc, store: st, validator: validator}
 }
 
 func (s *Server) Routes() http.Handler {
 	r := chi.NewRouter()
-	r.Post("/parties:find-or-create", withIdempotency(s.store, s.handleFindOrCreateParty))
-	r.Get("/parties/{partyId}", s.handleGetParty)
-	r.Patch("/parties/{partyId}", withIdempotency(s.store, s.handleUpdateParty))
-	r.Post("/parties/{partyId}:tombstone", withIdempotency(s.store, s.handleTombstoneParty))
-	r.Get("/parties/{partyId}/documents", s.handleListIdentityDocuments)
-	r.Post("/parties/{partyId}/documents", withIdempotency(s.store, s.handleAddIdentityDocument))
-	r.Get("/parties/{partyId}/documents/{documentId}", s.handleGetIdentityDocument)
+	r.Post("/parties:find-or-create", withScope(s.validator, auth.ScopePartyWrite, withIdempotency(s.store, s.handleFindOrCreateParty)))
+	r.Get("/parties/{partyId}", withScope(s.validator, auth.ScopePartyRead, s.handleGetParty))
+	r.Patch("/parties/{partyId}", withScope(s.validator, auth.ScopePartyWrite, withIdempotency(s.store, s.handleUpdateParty)))
+	r.Post("/parties/{partyId}:tombstone", withScope(s.validator, auth.ScopePartyWrite, withIdempotency(s.store, s.handleTombstoneParty)))
+	r.Get("/parties/{partyId}/documents", withScope(s.validator, auth.ScopePartyRead, s.handleListIdentityDocuments))
+	r.Post("/parties/{partyId}/documents", withScope(s.validator, auth.ScopePartyWrite, withIdempotency(s.store, s.handleAddIdentityDocument)))
+	r.Get("/parties/{partyId}/documents/{documentId}", withScope(s.validator, auth.ScopePartyRead, s.handleGetIdentityDocument))
 	return r
 }
 
