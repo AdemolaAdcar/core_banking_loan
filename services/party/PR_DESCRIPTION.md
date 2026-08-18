@@ -303,3 +303,43 @@ now wired up:
 
 **Verification:** `go build ./...`, `go vet ./...`, `gofmt -l .` (clean),
 and `go test ./...` all pass — 62/62 tests total.
+
+## Follow-up: integration test against live Postgres and Kafka
+
+Every test up to this point ran against in-memory fakes or, for
+`internal/auth`, a local `httptest` server — nothing had ever exercised
+`migrations/0001_init.up.sql`, `internal/store/postgres`'s real SQL and
+real AES-GCM encrypt/decrypt round-trip, or proven a message published
+via `internal/relay` is actually consumable from a real broker. Verified
+against genuinely live infrastructure and fixed as a real gap:
+
+- `internal/integration/integration_test.go` (build tag `integration`,
+  so it's excluded from normal `go build`/`go test ./...` and adds no
+  weight to the default dependency graph beyond `go.sum`) — spins up
+  disposable Postgres and Kafka containers via `testcontainers-go`
+  (`postgres:16-alpine`, `confluentinc/confluent-local:7.5.0`), applies
+  the real migration file, then runs one full lifecycle against them:
+  create → confirm the plaintext round-trips through real AES-GCM
+  encrypt-on-write/decrypt-on-read → a second `findOrCreateParty` call
+  with the same SSN proves the real indexed `ssn_hash` SQL query matches
+  the existing party rather than creating a duplicate (this path was
+  previously only exercised against the in-memory fake) → update →
+  tombstone → `relay.Publisher.PublishUnpublished` against the real
+  broker (asserts exactly 3 entries published, and a second call finds
+  0 left — proving `MarkPublished` actually persisted) → a real Kafka
+  consumer reads the `party.created` message back and decodes a payload
+  matching the created party.
+- Run with: `go test -tags=integration ./internal/integration/... -v`
+  — requires a working Docker daemon; every container is disposable and
+  torn down by testcontainers-go's own reaper (Ryuk) even on a crashed
+  test run, so nothing is left behind.
+- **Verified for real, not just written:** ran twice against a live
+  Colima Docker daemon on this machine — both runs passed
+  (`TestPartyLifecycle_AgainstLivePostgresAndKafka`, ~29s each), with no
+  leftover containers afterward.
+- One environment-specific note for Colima users: `testcontainers-go`
+  needs `DOCKER_HOST` pointed at the Colima socket and
+  `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock` (the
+  guest-VM-side path, not the host-side forwarded path) — otherwise the
+  Ryuk reaper container fails to bind-mount the socket. Not needed for a
+  standard Docker Desktop / Linux Docker daemon.
