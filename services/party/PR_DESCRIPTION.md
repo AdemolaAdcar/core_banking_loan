@@ -342,4 +342,42 @@ against genuinely live infrastructure and fixed as a real gap:
   `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock` (the
   guest-VM-side path, not the host-side forwarded path) — otherwise the
   Ryuk reaper container fails to bind-mount the socket. Not needed for a
-  standard Docker Desktop / Linux Docker daemon.
+  standard Docker Desktop / Linux Docker daemon, including GitHub-hosted
+  `ubuntu-latest` runners.
+
+## Follow-up: migration runner + CI
+
+`migrations/*.sql` existed but nothing ever actually ran them outside
+the integration test's own ad hoc application (via testcontainers'
+`WithInitScripts`, a mechanism specific to that test, not a real
+migration tool). Nothing checked this repo's state on every push either.
+Both fixed:
+
+- **Migration runner:** [golang-migrate](https://github.com/golang-migrate/migrate)
+  — the migration files were already named to its convention
+  (`{version}_{title}.up|down.sql`), so no renaming was needed. Verified
+  for real, not just installed: ran `up`, `version`, `down`, `up` again
+  against a disposable local Postgres container and confirmed the
+  correct table set (`parties`, `identity_documents`, `dedup_audit`,
+  `outbox`, `idempotency_keys`, plus `golang-migrate`'s own
+  `schema_migrations`) exists after `up` and is fully removed after
+  `down`.
+- `services/party/Makefile` — `build`, `vet`, `fmt-check`, `test`,
+  `test-integration`, and `migrate-up`/`migrate-down`/`migrate-version`/
+  `migrate-force` targets. `DATABASE_URL` and `MIGRATE` (the CLI binary
+  path) are both overridable, so the same targets work identically
+  locally and in CI.
+- **CI:** `.github/workflows/party-ci.yml` (new — this repo had no CI at
+  all before this), scoped to `services/party/**` and the Party specs so
+  it doesn't fire on unrelated changes elsewhere in this monorepo. Three
+  jobs, all on every push to `main` and every PR:
+  - `build-test` — `go build`, `go vet`, a `gofmt -l` check, `go test ./...`.
+  - `migrations` — a real Postgres service container; runs `up` →
+    `version` → `down` → `up` again through the Makefile targets above,
+    so a migration that doesn't actually reverse cleanly (or doesn't
+    re-apply cleanly from empty) fails CI, not just a human's local run.
+  - `integration-test` — runs `make test-integration` (the
+    `internal/integration` suite from the prior follow-up) directly;
+    GitHub-hosted `ubuntu-latest` runners have Docker pre-installed and
+    running, so `testcontainers-go` needs no special configuration there
+    (unlike local Colima).
