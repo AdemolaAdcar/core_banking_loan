@@ -36,6 +36,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: services/party/go.mod
+          cache-dependency-path: services/party/go.sum
       - run: go build ./...
       - run: go vet ./...
       - name: gofmt check
@@ -72,6 +73,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: services/party/go.mod
+          cache-dependency-path: services/party/go.sum
       - name: Put $(go env GOPATH)/bin on PATH
         run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Install golang-migrate CLI
@@ -93,6 +95,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: services/party/go.mod
+          cache-dependency-path: services/party/go.sum
       # ubuntu-latest runners ship Docker pre-installed and running --
       # no DOCKER_HOST/socket overrides needed here (those are only
       # required for local Colima setups; see PR_DESCRIPTION.md).
