@@ -1,26 +1,33 @@
 openapi: 3.1.0
 info:
   title: CRM API
-  version: 0.1.0
+  version: 0.2.0
   description: >
-    CRMAPI — drafted fresh in this increment, since CRM has no prior adapter
-    counterpart in the Personal Loan Solution's Core Banking Adapter Layer.
-    Flagged for the loan domain's architecture team to add CRMAdapter to
-    Section 16.1. Follows the same conventions as PartyAPI/AccountAPI/
-    GLPostingAPI/PaymentAPI (OpenAPI 3.1, shared JSON Schema objects via $ref,
-    Idempotency-Key on mutating operations, full error coverage), with one
-    absolute constraint unique to this file: no request or response schema
-    for logInteraction, openCase, or getCustomer360 may include a Money field
-    under any circumstance. This is enforced structurally — ServiceCase.schema.json
-    (../schemas/service-case.schema.json) has no property anywhere that
-    references money.schema.json, and this file never defines a local field
-    that would reintroduce one. CRM has no path into GLPostingAPI at all;
-    every operation here is either a pure write of non-monetary interaction
-    data or a pure read of status/interaction history — never a balance
-    mutation, and never a trigger for one.
+    CRMAPI — drafted fresh, since CRM has no prior adapter counterpart in the
+    Personal Loan Solution's Core Banking Adapter Layer. Flagged for the loan
+    domain's architecture team to add CRMAdapter to Section 16.1. Follows the
+    same conventions as PartyAPI/AccountAPI/GLPostingAPI/PaymentAPI (OpenAPI
+    3.1, shared JSON Schema objects via $ref, Idempotency-Key on mutating
+    operations, full error coverage), with one absolute constraint unique to
+    this file: no request or response schema anywhere in it may include a
+    Money field, under any circumstance. This is enforced structurally —
+    service-case.schema.json (../schemas/service-case.schema.json) has no
+    property anywhere that references money.schema.json, and this file never
+    defines a local field that would reintroduce one. CRM has no path into
+    GLPostingAPI at all; every operation here is either a pure write of
+    non-monetary interaction/case/preference data or a pure read of status —
+    never a balance mutation, and never a trigger for one.
+
+    v0.2.0 (BREAKING from v0.1.0) adds the case-lifecycle, relationship-
+    manager, and communication-preferences surface the CRM Codegen Agent's
+    role requires — updateCase/closeCase/reopenCase, addCaseNote/
+    listCaseNotes, assignRelationshipManager/getRelationshipManager,
+    get/updateCommunicationPreferences — none of which existed before this
+    increment; v0.1.0 only covered logInteraction/openCase/getCase/
+    getCustomer360.
   x-adapter: CRMAdapter
   x-adapter-status: PROPOSED — no existing counterpart in the Core Banking Adapter Layer prior to this spec
-  x-epics: [CB-BOOK, CB-DISB, CB-REPAY, CB-DELINQ, CB-PAYOFF]
+  x-epics: [CB-BOOK, CB-DISB, CB-REPAY, CB-DELINQ, CB-PAYOFF, CRM-CASE]
   x-req-ids:
     - REQ-CB-BOOK-005
     - REQ-CB-DISB-005
@@ -157,12 +164,7 @@ paths:
       summary: Retrieve a service case
       tags: [ServiceCase]
       parameters:
-        - name: caseId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: '#/components/parameters/CaseId'
       responses:
         '200':
           description: Current case state
@@ -194,14 +196,12 @@ paths:
         Customer360 is explicitly a CRM read model, not a ledger read model;
         a CSR needing balance data calls AccountAPI directly through a
         properly scoped, audited path, not through this endpoint.
+        recentInteractions[].notes is PII-adjacent content — every call to
+        this operation is access-logged (actor + timestamp), same as
+        listCaseNotes.
       tags: [Customer360]
       parameters:
-        - name: partyId
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: '#/components/parameters/PartyId'
       responses:
         '200':
           description: Consolidated customer view
@@ -220,8 +220,375 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /cases/{caseId}:update:
+    post:
+      operationId: updateCase
+      summary: Update a case in progress — status transition and/or reassignment
+      description: >
+        Permits Open→InProgress, InProgress→Resolved, and Open→Resolved
+        transitions, and/or changing assignedTo — never a transition to or
+        from Closed (see closeCase/reopenCase, which own that boundary for
+        clearer audit/event semantics). Requires expectedVersion (the
+        caller's last-read ServiceCase.version) for optimistic concurrency:
+        if another update has landed since, this returns 409 rather than
+        silently overwriting it — the caller re-reads via getCase and
+        retries. Idempotent on the Idempotency-Key header.
+      tags: [ServiceCase]
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCaseRequest'
+      responses:
+        '200':
+          description: Case updated (or idempotent replay)
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/ServiceCase'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: >-
+            expectedVersion is stale (concurrent update), the requested
+            status transition is not permitted from the case's current
+            status, or the Idempotency-Key was reused with a materially
+            different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /cases/{caseId}:close:
+    post:
+      operationId: closeCase
+      summary: Close a case
+      description: >
+        Permitted from Open, InProgress, or Resolved. Idempotent — closing
+        an already-closed case is a no-op success, not an error, since a
+        retried request must not fail just because it already succeeded
+        once.
+      tags: [ServiceCase]
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloseCaseRequest'
+      responses:
+        '200':
+          description: Case closed (or already closed — idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/ServiceCase'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /cases/{caseId}:reopen:
+    post:
+      operationId: reopenCase
+      summary: Reopen a closed case
+      description: >
+        Permitted ONLY from Closed — reopening any other status is a 409,
+        not a no-op (unlike closeCase's idempotent-on-already-closed
+        behavior: reopening a case that was never closed is a genuine
+        state error, not a retry of a prior success). On reopen, status
+        returns to Open (not InProgress), escalated resets to false, and
+        slaDueAt is recomputed from now — a reopened case gets a fresh SLA
+        clock, not the remainder of its original one.
+      tags: [ServiceCase]
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReopenCaseRequest'
+      responses:
+        '200':
+          description: Case reopened
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/ServiceCase'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Case is not currently Closed
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /cases/{caseId}/notes:
+    get:
+      operationId: listCaseNotes
+      summary: Retrieve every note on a case, oldest first
+      description: >
+        Append-only — a correction is a new note, never an edit of a prior
+        one. CaseNote.body is PII-adjacent content: every call to this
+        operation is access-logged (actor + timestamp) and this operation
+        is excluded from any bulk/analytics export path.
+      tags: [ServiceCase]
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+      responses:
+        '200':
+          description: Case notes, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '../schemas/service-case.schema.json#/$defs/CaseNote'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      operationId: addCaseNote
+      summary: Append a note to a case
+      description: >
+        Idempotent on the Idempotency-Key header. body is encrypted at rest
+        (see internal/pii.Encryptor's counterpart in this service) and
+        never appears in any domain event payload.
+      tags: [ServiceCase]
+      parameters:
+        - $ref: '#/components/parameters/CaseId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddCaseNoteRequest'
+      responses:
+        '201':
+          description: Note added
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/CaseNote'
+        '200':
+          description: Idempotent replay — original note returned, nothing re-added
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/CaseNote'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /customers/{partyId}/relationship-manager:
+    get:
+      operationId: getRelationshipManager
+      summary: Retrieve a customer's current relationship-manager assignment
+      description: >
+        A persistent, per-customer relationship — distinct from any single
+        case's assignedTo. relationshipManagerId is null if none is
+        currently assigned.
+      tags: [RelationshipManager]
+      parameters:
+        - $ref: '#/components/parameters/PartyId'
+      responses:
+        '200':
+          description: Current assignment (relationshipManagerId null if none)
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/RelationshipManagerAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      operationId: assignRelationshipManager
+      summary: Assign (or reassign) a customer's relationship manager
+      description: >
+        Overwrites any prior assignment — the prior assignment is not
+        deleted, it is superseded (retained in the audit trail, never a row
+        deletion, same discipline as everywhere else in this system).
+        Idempotent on the Idempotency-Key header.
+      tags: [RelationshipManager]
+      parameters:
+        - $ref: '#/components/parameters/PartyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignRelationshipManagerRequest'
+      responses:
+        '200':
+          description: Relationship manager assigned (or idempotent replay)
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/RelationshipManagerAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /customers/{partyId}/communication-preferences:
+    get:
+      operationId: getCommunicationPreferences
+      summary: Retrieve a customer's communication preferences
+      description: >
+        Always returns 200 — a party that has never set preferences gets
+        the conservative default (preferredChannel null, every opt-in
+        false) rather than a 404, since every party implicitly has an
+        (unset) preference state.
+      tags: [CommunicationPreferences]
+      parameters:
+        - $ref: '#/components/parameters/PartyId'
+      responses:
+        '200':
+          description: Current preferences (defaults if never explicitly set)
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/CommunicationPreferences'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    put:
+      operationId: updateCommunicationPreferences
+      summary: Replace a customer's communication preferences
+      description: >
+        Full replace, not a partial patch — every field in the request body
+        is required so there is no ambiguity about what "not supplied"
+        means for a preference toggle. Idempotent on the Idempotency-Key
+        header.
+      tags: [CommunicationPreferences]
+      parameters:
+        - $ref: '#/components/parameters/PartyId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCommunicationPreferencesRequest'
+      responses:
+        '200':
+          description: Preferences updated (or idempotent replay)
+          content:
+            application/json:
+              schema:
+                $ref: '../schemas/service-case.schema.json#/$defs/CommunicationPreferences'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Idempotency-Key reused with a materially different payload
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   parameters:
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    PartyId:
+      name: partyId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -239,9 +606,13 @@ components:
           tokenUrl: https://auth.internal.core-banking.example/oauth2/token
           scopes:
             crm:interaction:write: Log interactions
-            crm:case:write: Open service cases
-            crm:case:read: Read service cases
+            crm:case:write: Open, update, close, and reopen service cases; add case notes
+            crm:case:read: Read service cases and case notes
             crm:customer360:read: Read the consolidated customer view
+            crm:relationshipmanager:write: Assign relationship managers
+            crm:relationshipmanager:read: Read relationship-manager assignments
+            crm:commprefs:write: Update communication preferences
+            crm:commprefs:read: Read communication preferences
 
   responses:
     BadRequest:
@@ -309,3 +680,70 @@ components:
           enum: [GENERAL_INQUIRY, PAYMENT_DISPUTE, HARDSHIP_REQUEST, DELINQUENCY_FOLLOWUP, OTHER]
         assignedTo:
           type: ["string", "null"]
+
+    UpdateCaseRequest:
+      type: object
+      description: >-
+        status, if supplied, must be a permitted transition from the case's
+        current status (see updateCase's own description) — Open→InProgress,
+        InProgress→Resolved, or Open→Resolved only.
+      required: [expectedVersion]
+      properties:
+        expectedVersion:
+          type: integer
+          minimum: 1
+        status:
+          type: ["string", "null"]
+          enum: [Open, InProgress, Resolved, null]
+        assignedTo:
+          type: ["string", "null"]
+
+    CloseCaseRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          description: Free-text closure summary. PII-adjacent — same handling as CaseNote.body.
+
+    ReopenCaseRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          description: Free-text reason for reopening. PII-adjacent — same handling as CaseNote.body.
+
+    AddCaseNoteRequest:
+      type: object
+      required: [authorId, body]
+      properties:
+        authorId:
+          type: string
+        body:
+          type: string
+
+    AssignRelationshipManagerRequest:
+      type: object
+      required: [relationshipManagerId]
+      properties:
+        relationshipManagerId:
+          type: string
+
+    UpdateCommunicationPreferencesRequest:
+      type: object
+      required: [preferredChannel, emailOptIn, smsOptIn, phoneOptIn, mailOptIn, doNotContact]
+      properties:
+        preferredChannel:
+          type: ["string", "null"]
+          enum: [EMAIL, SMS, PHONE, MAIL, NONE, null]
+        emailOptIn:
+          type: boolean
+        smsOptIn:
+          type: boolean
+        phoneOptIn:
+          type: boolean
+        mailOptIn:
+          type: boolean
+        doNotContact:
+          type: boolean

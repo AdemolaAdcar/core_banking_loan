@@ -28,7 +28,7 @@
     },
     "ServiceCase": {
       "type": "object",
-      "required": ["caseId", "partyId", "status", "reasonCode", "openedAt", "updatedAt"],
+      "required": ["caseId", "partyId", "status", "reasonCode", "version", "slaDueAt", "escalated", "openedAt", "updatedAt"],
       "properties": {
         "caseId": {
           "type": "string",
@@ -37,23 +37,104 @@
         },
         "loanAccountId": { "type": ["string", "null"], "format": "uuid" },
         "partyId": { "type": "string", "format": "uuid" },
-        "status": { "type": "string", "enum": ["Open", "InProgress", "Resolved", "Closed"] },
+        "status": {
+          "type": "string",
+          "enum": ["Open", "InProgress", "Resolved", "Closed"],
+          "description": "Reopening a Closed case returns it to Open, not InProgress -- a reopened case restarts the workflow. See updateCase/closeCase/reopenCase for exactly which transitions each operation permits."
+        },
         "reasonCode": {
           "type": "string",
           "enum": ["GENERAL_INQUIRY", "PAYMENT_DISPUTE", "HARDSHIP_REQUEST", "DELINQUENCY_FOLLOWUP", "OTHER"]
         },
         "assignedTo": { "type": ["string", "null"], "x-pii": false },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optimistic-concurrency token, incremented on every updateCase/closeCase/reopenCase. updateCase requires the caller's last-read version; a mismatch means someone else updated this case first, and returns 409 rather than silently overwriting their change."
+        },
+        "slaDueAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "openedAt (or reopenedAt, on reopen) plus a fixed duration keyed by reasonCode -- see the CRM design note's SLA table. Recomputed on reopen; untouched by updateCase."
+        },
+        "escalated": {
+          "type": "boolean",
+          "description": "Set true by the SLA sweep (not by any caller-facing write) the first time an Open/InProgress case is observed past slaDueAt. Reset to false on reopen, alongside a freshly computed slaDueAt."
+        },
+        "closeReason": { "type": ["string", "null"], "x-pii": true },
+        "reopenReason": { "type": ["string", "null"], "x-pii": true },
         "openedAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "additionalProperties": false
     },
+
+    "CaseNote": {
+      "type": "object",
+      "required": ["noteId", "caseId", "authorId", "body", "createdAt"],
+      "properties": {
+        "noteId": { "type": "string", "format": "uuid" },
+        "caseId": { "type": "string", "format": "uuid" },
+        "authorId": {
+          "type": "string",
+          "description": "The CSR/system actor who wrote this note -- not itself PII (an internal identity), unlike body."
+        },
+        "body": {
+          "type": "string",
+          "x-pii": true,
+          "description": "Free-text case narrative -- complaint detail, resolution summary, etc. Encrypted at rest; every read is access-logged with actor and timestamp; never included in any bulk/analytics export path. Append-only, same immutability discipline as everywhere else in this system -- a correction is a new note, never an edit of a prior one."
+        },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+
+    "CommunicationPreferences": {
+      "type": "object",
+      "required": ["partyId", "preferredChannel", "emailOptIn", "smsOptIn", "phoneOptIn", "mailOptIn", "doNotContact", "updatedAt"],
+      "properties": {
+        "partyId": { "type": "string", "format": "uuid" },
+        "preferredChannel": {
+          "type": ["string", "null"],
+          "enum": ["EMAIL", "SMS", "PHONE", "MAIL", "NONE", null],
+          "description": "Null means never explicitly set -- getCommunicationPreferences returns the conservative default (null channel, every opt-in false) rather than 404, since every party implicitly has a (unset) preference state."
+        },
+        "emailOptIn": { "type": "boolean" },
+        "smsOptIn": { "type": "boolean" },
+        "phoneOptIn": { "type": "boolean" },
+        "mailOptIn": { "type": "boolean" },
+        "doNotContact": {
+          "type": "boolean",
+          "description": "Overrides every channel-level opt-in when true -- a global suppression flag, not just another channel toggle."
+        },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+
+    "RelationshipManagerAssignment": {
+      "type": "object",
+      "required": ["partyId", "relationshipManagerId", "assignedAt"],
+      "properties": {
+        "partyId": { "type": "string", "format": "uuid" },
+        "relationshipManagerId": {
+          "type": ["string", "null"],
+          "description": "Null means no RM currently assigned. This is a persistent, per-customer relationship -- distinct from ServiceCase.assignedTo, which is the CSR working one specific case and has no bearing on who the customer's ongoing relationship manager is."
+        },
+        "assignedAt": { "type": ["string", "null"], "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
     "Customer360": {
       "type": "object",
-      "required": ["partyId", "displayName", "loanAccountSummaries", "recentInteractions", "openCases"],
+      "required": ["partyId", "displayName", "loanAccountSummaries", "recentInteractions", "openCases", "currentRelationshipManagerId"],
       "properties": {
         "partyId": { "type": "string", "format": "uuid" },
         "displayName": { "type": "string", "x-pii": true },
+        "currentRelationshipManagerId": {
+          "type": ["string", "null"],
+          "description": "Mirrors RelationshipManagerAssignment.relationshipManagerId — null if none assigned."
+        },
         "loanAccountSummaries": {
           "type": "array",
           "items": {

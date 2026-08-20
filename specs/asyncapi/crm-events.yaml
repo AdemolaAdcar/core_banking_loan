@@ -1,0 +1,327 @@
+asyncapi: 2.6.0
+info:
+  title: CRM Events
+  version: 0.1.0
+  description: >
+    Domain events published by CRMAdapter. First increment — CRM had no
+    async contract before this (it was purely an event SUBSCRIBER to the
+    loan-side adapters; see docs/design-notes.md). Every state change
+    (interaction logged, case opened/updated/closed/reopened/escalated,
+    relationship manager assigned, communication preferences updated)
+    publishes its corresponding event transactionally with the database
+    write via the outbox pattern — the same discipline used everywhere
+    else in this system, even though none of these events carry money.
+    Deliberately, no payload here carries case-note/narrative content —
+    CaseNote.body and CloseCaseRequest/ReopenCaseRequest.reason are
+    PII-adjacent and excluded from any bulk/analytics export path; an
+    event bus fanning out to multiple consumers is exactly that kind of
+    path, so these events carry IDs and status metadata only, the same
+    principle party-events.yaml applies to PII.
+
+    No consumer for these events exists elsewhere in this system today —
+    every other module's adapter is upstream of CRM (CRM subscribes to
+    THEM), not downstream. These are published anyway, per the ground
+    rule that every state change publishes its event unconditionally, not
+    only when a consumer is already known to exist — x-consumers is left
+    empty on every channel below, documented as "no current consumer,
+    forward-compatible" rather than omitted, so a future consumer (e.g. a
+    supervisor-alerting service reacting to crm.case.escalated) has a
+    contract to build against.
+  x-adapter: CRMAdapter
+
+defaultContentType: application/json
+
+servers:
+  production:
+    url: events.internal.core-banking.example:9092
+    protocol: kafka
+    description: Core Banking domain event backbone
+
+channels:
+  crm.interaction.logged:
+    description: >
+      Published once, transactionally, on every successful logInteraction
+      call (including the very first call for a given source-event
+      idempotency key — not published again on an idempotent replay).
+      x-consumers: [] — no current consumer, forward-compatible.
+    publish:
+      operationId: publishInteractionLogged
+      summary: A customer interaction was logged
+      message:
+        $ref: '#/components/messages/InteractionLogged'
+
+  crm.case.opened:
+    description: >
+      Published once, transactionally, when openCase creates a new case
+      (not on an idempotent replay).
+      x-consumers: [] — no current consumer, forward-compatible.
+    publish:
+      operationId: publishCaseOpened
+      summary: A new service case was opened
+      message:
+        $ref: '#/components/messages/CaseOpened'
+
+  crm.case.updated:
+    description: >
+      Published once, transactionally, on every successful updateCase call
+      that actually changes status and/or assignedTo — never on a call
+      that supplies only the current values (no-op, no event, same
+      discipline as PartyAPI's updateParty).
+      x-consumers: [] — no current consumer, forward-compatible.
+    publish:
+      operationId: publishCaseUpdated
+      summary: A case's status and/or assignee changed
+      message:
+        $ref: '#/components/messages/CaseUpdated'
+
+  crm.case.closed:
+    description: >
+      Published once, transactionally, the first time a case is closed
+      (not on the idempotent no-op of closing an already-closed case).
+      x-consumers: [] — no current consumer, forward-compatible.
+    publish:
+      operationId: publishCaseClosed
+      summary: A case was closed
+      message:
+        $ref: '#/components/messages/CaseClosed'
+
+  crm.case.reopened:
+    description: >
+      Published once, transactionally, on every successful reopenCase call.
+      x-consumers: [] — no current consumer, forward-compatible.
+    publish:
+      operationId: publishCaseReopened
+      summary: A closed case was reopened
+      message:
+        $ref: '#/components/messages/CaseReopened'
+
+  crm.case.escalated:
+    description: >
+      Published once, transactionally, by the SLA sweep (never by a
+      caller-facing write) the first time an Open/InProgress case is
+      observed past its slaDueAt. Never published a second time for the
+      same breach — escalated is a one-way flag until the case is either
+      closed or reopened (reopen resets it and gives the case a fresh
+      slaDueAt).
+      x-consumers: [] — no current consumer, forward-compatible; the
+      intended future consumer is a supervisor-alerting/paging service.
+    publish:
+      operationId: publishCaseEscalated
+      summary: A case breached its SLA deadline
+      message:
+        $ref: '#/components/messages/CaseEscalated'
+
+  crm.caseNote.added:
+    description: >
+      Published once, transactionally, on every successful addCaseNote
+      call (not on an idempotent replay). The payload deliberately
+      excludes CaseNote.body — PII-adjacent narrative content never
+      appears in an event payload; a consumer that needs the note text
+      itself calls listCaseNotes through a properly scoped, audited path.
+      x-consumers: [] — no current consumer, forward-compatible.
+    publish:
+      operationId: publishCaseNoteAdded
+      summary: A note was added to a case
+      message:
+        $ref: '#/components/messages/CaseNoteAdded'
+
+  crm.relationshipManager.assigned:
+    description: >
+      Published once, transactionally, on every successful
+      assignRelationshipManager call that actually changes the assignment
+      (not on a call that reassigns the same RM already on file).
+      x-consumers: [] — no current consumer, forward-compatible.
+    publish:
+      operationId: publishRelationshipManagerAssigned
+      summary: A customer's relationship-manager assignment changed
+      message:
+        $ref: '#/components/messages/RelationshipManagerAssigned'
+
+  crm.communicationPreferences.updated:
+    description: >
+      Published once, transactionally, on every successful
+      updateCommunicationPreferences call. Carries the new preference
+      VALUES (channel opt-in booleans are not PII in the way a name/SSN
+      is, and downstream consumers — e.g. a notification-dispatch service
+      — need the actual values to act on, unlike PartyUpdated's
+      field-names-only convention for genuinely sensitive contact data).
+      x-consumers: [] — no current consumer, forward-compatible; the
+      intended future consumer is whichever service actually dispatches
+      customer notifications.
+    publish:
+      operationId: publishCommunicationPreferencesUpdated
+      summary: A customer's communication preferences were updated
+      message:
+        $ref: '#/components/messages/CommunicationPreferencesUpdated'
+
+components:
+  messages:
+    InteractionLogged:
+      name: InteractionLogged
+      title: Interaction Logged
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/InteractionLoggedPayload'
+
+    CaseOpened:
+      name: CaseOpened
+      title: Case Opened
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/CaseOpenedPayload'
+
+    CaseUpdated:
+      name: CaseUpdated
+      title: Case Updated
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/CaseUpdatedPayload'
+
+    CaseClosed:
+      name: CaseClosed
+      title: Case Closed
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/CaseClosedPayload'
+
+    CaseReopened:
+      name: CaseReopened
+      title: Case Reopened
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/CaseReopenedPayload'
+
+    CaseEscalated:
+      name: CaseEscalated
+      title: Case Escalated
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/CaseEscalatedPayload'
+
+    CaseNoteAdded:
+      name: CaseNoteAdded
+      title: Case Note Added
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/CaseNoteAddedPayload'
+
+    RelationshipManagerAssigned:
+      name: RelationshipManagerAssigned
+      title: Relationship Manager Assigned
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/RelationshipManagerAssignedPayload'
+
+    CommunicationPreferencesUpdated:
+      name: CommunicationPreferencesUpdated
+      title: Communication Preferences Updated
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/CommunicationPreferencesUpdatedPayload'
+
+  schemas:
+    InteractionLoggedPayload:
+      type: object
+      required: [interactionId, loanAccountId, eventType, occurredAt]
+      properties:
+        interactionId: { type: string, format: uuid }
+        loanAccountId: { type: string, format: uuid }
+        eventType:
+          type: string
+          enum:
+            - ACCOUNT_BOOKED
+            - ACCOUNT_DISBURSED
+            - REPAYMENT_POSTED
+            - DELINQUENCY_STATUS_CHANGED
+            - ACCOUNT_CLOSED
+            - ACCOUNT_CHARGED_OFF
+            - TERMS_MODIFIED
+        occurredAt: { type: string, format: date-time }
+      description: Deliberately excludes Interaction.notes — free-text content never appears in an event payload.
+
+    CaseOpenedPayload:
+      type: object
+      required: [caseId, partyId, reasonCode, status, openedAt]
+      properties:
+        caseId: { type: string, format: uuid }
+        partyId: { type: string, format: uuid }
+        loanAccountId: { type: ["string", "null"], format: uuid }
+        reasonCode:
+          type: string
+          enum: [GENERAL_INQUIRY, PAYMENT_DISPUTE, HARDSHIP_REQUEST, DELINQUENCY_FOLLOWUP, OTHER]
+        status: { type: string, enum: [Open] }
+        openedAt: { type: string, format: date-time }
+
+    CaseUpdatedPayload:
+      type: object
+      required: [caseId, changedFields, updatedAt]
+      properties:
+        caseId: { type: string, format: uuid }
+        changedFields:
+          type: array
+          items: { type: string }
+          description: Field NAMES only, e.g. ["status", "assignedTo"] — never the values, same convention as PartyUpdatedPayload.
+        updatedAt: { type: string, format: date-time }
+
+    CaseClosedPayload:
+      type: object
+      required: [caseId, closedAt]
+      properties:
+        caseId: { type: string, format: uuid }
+        closedAt: { type: string, format: date-time }
+      description: Deliberately excludes the closure reason — PII-adjacent free text never appears in an event payload.
+
+    CaseReopenedPayload:
+      type: object
+      required: [caseId, reopenedAt, slaDueAt]
+      properties:
+        caseId: { type: string, format: uuid }
+        reopenedAt: { type: string, format: date-time }
+        slaDueAt: { type: string, format: date-time }
+      description: Deliberately excludes the reopen reason — PII-adjacent free text never appears in an event payload.
+
+    CaseEscalatedPayload:
+      type: object
+      required: [caseId, partyId, reasonCode, slaDueAt, escalatedAt]
+      properties:
+        caseId: { type: string, format: uuid }
+        partyId: { type: string, format: uuid }
+        reasonCode:
+          type: string
+          enum: [GENERAL_INQUIRY, PAYMENT_DISPUTE, HARDSHIP_REQUEST, DELINQUENCY_FOLLOWUP, OTHER]
+        slaDueAt: { type: string, format: date-time }
+        escalatedAt: { type: string, format: date-time }
+
+    CaseNoteAddedPayload:
+      type: object
+      required: [noteId, caseId, authorId, createdAt]
+      properties:
+        noteId: { type: string, format: uuid }
+        caseId: { type: string, format: uuid }
+        authorId: { type: string }
+        createdAt: { type: string, format: date-time }
+      description: Deliberately excludes CaseNote.body — PII-adjacent narrative content never appears in an event payload.
+
+    RelationshipManagerAssignedPayload:
+      type: object
+      required: [partyId, relationshipManagerId, assignedAt]
+      properties:
+        partyId: { type: string, format: uuid }
+        relationshipManagerId: { type: string }
+        previousRelationshipManagerId: { type: ["string", "null"] }
+        assignedAt: { type: string, format: date-time }
+
+    CommunicationPreferencesUpdatedPayload:
+      type: object
+      required: [partyId, preferredChannel, emailOptIn, smsOptIn, phoneOptIn, mailOptIn, doNotContact, updatedAt]
+      properties:
+        partyId: { type: string, format: uuid }
+        preferredChannel:
+          type: ["string", "null"]
+          enum: [EMAIL, SMS, PHONE, MAIL, NONE, null]
+        emailOptIn: { type: boolean }
+        smsOptIn: { type: boolean }
+        phoneOptIn: { type: boolean }
+        mailOptIn: { type: boolean }
+        doNotContact: { type: boolean }
+        updatedAt: { type: string, format: date-time }

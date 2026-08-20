@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS idempotency_keys;
+DROP TABLE IF EXISTS outbox;
+DROP TABLE IF EXISTS loan_account_links;
+DROP TABLE IF EXISTS relationship_manager_assignments;
+DROP TABLE IF EXISTS communication_preferences;
+DROP TABLE IF EXISTS case_note_access_log;
+DROP TABLE IF EXISTS case_notes;
+DROP TABLE IF EXISTS interactions;
+DROP TABLE IF EXISTS cases;
