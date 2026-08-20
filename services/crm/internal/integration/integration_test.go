@@ -1,17 +1,16 @@
 //go:build integration
 
-// Package integration exercises the CRM service against a real
-// Postgres — every other test in this codebase runs against in-memory
+// Package integration exercises the CRM service against real Postgres
+// and Kafka — every other test in this codebase runs against in-memory
 // fakes (internal/service, internal/api) or, for internal/auth, a real
 // httptest server. Nothing before this file has ever actually run
 // migrations/0001_init.up.sql, exercised internal/store/postgres's real
-// SQL and real AES-GCM encrypt/decrypt round-trip, or proven the
+// SQL and real AES-GCM encrypt/decrypt round-trip, proven the
 // database-level optimistic-concurrency guard (UpdateCaseConditional's
 // "WHERE version = $N") actually closes a race two in-memory-only tests
-// cannot. Unlike services/party's equivalent, this does not also spin up
-// Kafka -- CRM has no Kafka-backed outbox publisher yet (see
-// PR_DESCRIPTION.md). Gated behind the "integration" build tag and
-// requires a working Docker daemon:
+// cannot, or proven a message published via internal/relay is actually
+// consumable from a real broker. Gated behind the "integration" build
+// tag and requires a working Docker daemon:
 //
 //	go test -tags=integration ./internal/integration/... -v
 package integration
@@ -19,26 +18,40 @@ package integration
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
+	"net"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	kafkago "github.com/segmentio/kafka-go"
 	"github.com/testcontainers/testcontainers-go"
+	tckafka "github.com/testcontainers/testcontainers-go/modules/kafka"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/AdemolaAdcar/core_banking_loan/services/crm/internal/domain"
+	"github.com/AdemolaAdcar/core_banking_loan/services/crm/internal/events"
 	"github.com/AdemolaAdcar/core_banking_loan/services/crm/internal/pii"
+	"github.com/AdemolaAdcar/core_banking_loan/services/crm/internal/relay"
 	"github.com/AdemolaAdcar/core_banking_loan/services/crm/internal/service"
 	"github.com/AdemolaAdcar/core_banking_loan/services/crm/internal/store/postgres"
 )
 
-func TestCaseLifecycle_AgainstLivePostgres(t *testing.T) {
+func TestCaseLifecycle_AgainstLivePostgresAndKafka(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	pool, encryptor := startPostgres(ctx, t)
+	brokers := startKafka(ctx, t)
+	createTopics(ctx, t, brokers,
+		events.TopicInteractionLogged, events.TopicCaseOpened, events.TopicCaseUpdated, events.TopicCaseClosed,
+		events.TopicCaseReopened, events.TopicCaseEscalated, events.TopicCaseNoteAdded,
+		events.TopicRelationshipManagerAssigned, events.TopicCommunicationPreferencesUpdated,
+	)
+
 	st := postgres.New(pool, encryptor)
 	svc := service.New(st)
 
@@ -152,6 +165,18 @@ func TestCaseLifecycle_AgainstLivePostgres(t *testing.T) {
 		t.Fatalf("expected Open after reopen, got %s", reopened.Status)
 	}
 
+	// Close it again so it doesn't linger Open into the SLA-sweep section
+	// below -- ListCasesPastSLA scans every case in the store, not just
+	// ones a particular Service instance created, and this reopened
+	// case's freshly reset 24h SLA window would otherwise land close
+	// enough in time to also cross the sweep's fast-forwarded clock
+	// alongside the dedicated SLA test case, making the Kafka consumer
+	// assertion below non-deterministic about which escalation it reads
+	// first. A real workflow closes a reopened case again anyway.
+	if _, err := svc.CloseCase(ctx, service.CloseCaseInput{CaseID: out.ID, Reason: "resolved after reopen"}); err != nil {
+		t.Fatalf("CloseCase (after reopen): %v", err)
+	}
+
 	// --- 5. Relationship manager ----------------------------------------
 	rm, err := svc.AssignRelationshipManager(ctx, service.AssignRelationshipManagerInput{PartyID: "party-1", RelationshipManagerID: "rm-1"})
 	if err != nil {
@@ -229,6 +254,53 @@ func TestCaseLifecycle_AgainstLivePostgres(t *testing.T) {
 	if !foundEscalated {
 		t.Fatalf("expected a crm.case.escalated outbox entry to have been written, got topics: %+v", unpublished)
 	}
+
+	// --- 8. Relay: real outbox rows -> real Kafka broker ----------------
+	writer := &kafkago.Writer{Addr: kafkago.TCP(brokers...), Balancer: &kafkago.LeastBytes{}}
+	defer writer.Close()
+	publisher := relay.NewPublisher(st, writer, 100)
+
+	published, err := publisher.PublishUnpublished(ctx)
+	if err != nil {
+		t.Fatalf("PublishUnpublished: %v", err)
+	}
+	if published == 0 {
+		t.Fatalf("expected at least 1 outbox entry published")
+	}
+
+	// A second call must find nothing left -- proves MarkPublished
+	// actually persisted against real Postgres, not just in memory.
+	again, err := publisher.PublishUnpublished(ctx)
+	if err != nil {
+		t.Fatalf("PublishUnpublished (second call): %v", err)
+	}
+	if again != 0 {
+		t.Fatalf("expected no unpublished entries left after the first publish, got %d", again)
+	}
+
+	// --- 9. Consume from the real broker to prove delivery happened ---
+	reader := kafkago.NewReader(kafkago.ReaderConfig{
+		Brokers:     brokers,
+		Topic:       events.TopicCaseEscalated,
+		GroupID:     "integration-test-consumer",
+		StartOffset: kafkago.FirstOffset,
+	})
+	defer reader.Close()
+
+	readCtx, readCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer readCancel()
+	msg, err := reader.ReadMessage(readCtx)
+	if err != nil {
+		t.Fatalf("expected to consume a real crm.case.escalated message from kafka: %v", err)
+	}
+
+	var payload events.CaseEscalatedPayload
+	if err := json.Unmarshal(msg.Value, &payload); err != nil {
+		t.Fatalf("decoding consumed crm.case.escalated payload: %v", err)
+	}
+	if payload.CaseID != slaCase.ID {
+		t.Fatalf("expected consumed message for case %s, got %s", slaCase.ID, payload.CaseID)
+	}
 }
 
 // mustListCaseNotesAndLogAccess is a thin wrapper so the actor subject
@@ -241,6 +313,49 @@ func mustListCaseNotesAndLogAccess(ctx context.Context, t *testing.T, svc *servi
 		t.Fatalf("ListCaseNotes: %v", err)
 	}
 	return notes, actor
+}
+
+func createTopics(ctx context.Context, t *testing.T, brokers []string, topics ...string) {
+	t.Helper()
+	conn, err := kafkago.DialContext(ctx, "tcp", brokers[0])
+	if err != nil {
+		t.Fatalf("dialing kafka to create topics: %v", err)
+	}
+	defer conn.Close()
+
+	controller, err := conn.Controller()
+	if err != nil {
+		t.Fatalf("finding kafka controller: %v", err)
+	}
+	controllerConn, err := kafkago.DialContext(ctx, "tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
+	if err != nil {
+		t.Fatalf("dialing kafka controller: %v", err)
+	}
+	defer controllerConn.Close()
+
+	configs := make([]kafkago.TopicConfig, len(topics))
+	for i, topic := range topics {
+		configs[i] = kafkago.TopicConfig{Topic: topic, NumPartitions: 1, ReplicationFactor: 1}
+	}
+	if err := controllerConn.CreateTopics(configs...); err != nil {
+		t.Fatalf("creating topics %v: %v", topics, err)
+	}
+}
+
+func startKafka(ctx context.Context, t *testing.T) []string {
+	t.Helper()
+
+	kafkaContainer, err := tckafka.Run(ctx, "confluentinc/confluent-local:7.5.0", tckafka.WithClusterID("integration-test"))
+	if err != nil {
+		t.Fatalf("starting kafka container: %v", err)
+	}
+	t.Cleanup(func() { _ = kafkaContainer.Terminate(context.Background()) })
+
+	brokers, err := kafkaContainer.Brokers(ctx)
+	if err != nil {
+		t.Fatalf("getting kafka brokers: %v", err)
+	}
+	return brokers
 }
 
 func startPostgres(ctx context.Context, t *testing.T) (*pgxpool.Pool, *pii.AESGCMEncryptor) {

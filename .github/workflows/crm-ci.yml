@@ -89,7 +89,7 @@ jobs:
         run: make migrate-up
 
   integration-test:
-    name: Integration test (live Postgres via testcontainers)
+    name: Integration test (live Postgres + Kafka via testcontainers)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -99,7 +99,5 @@ jobs:
           cache-dependency-path: services/crm/go.sum
       # ubuntu-latest runners ship Docker pre-installed and running --
       # no DOCKER_HOST/socket overrides needed here (those are only
-      # required for local Colima setups; see PR_DESCRIPTION.md). Unlike
-      # party-ci.yml's equivalent job, this doesn't need a Kafka
-      # container -- CRM has no Kafka-backed outbox publisher yet.
+      # required for local Colima setups; see PR_DESCRIPTION.md).
       - run: make test-integration

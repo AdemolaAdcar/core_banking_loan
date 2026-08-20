@@ -30,10 +30,8 @@ test:
 	go test ./...
 
 # Requires a working Docker daemon -- spins up its own disposable
-# Postgres container via testcontainers-go, see
-# internal/integration/integration_test.go. Unlike services/party's
-# equivalent target, this does not also spin up Kafka -- CRM has no
-# Kafka-backed outbox publisher yet (see PR_DESCRIPTION.md).
+# Postgres and Kafka containers via testcontainers-go, see
+# internal/integration/integration_test.go.
 test-integration:
 	go test -tags=integration ./internal/integration/... -v
 

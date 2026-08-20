@@ -116,16 +116,11 @@ Customer360's loan-account summaries carry **status only** — derived
   DTO — it's `x-pii: true` and sourced from Party/CIF, which this
   service has no read path into in this increment. Same flagged-gap
   reasoning as above, not an oversight.
-- **A concrete Kafka-backed `outbox.Publisher`** — not built here,
-  consistent with how `services/party` handled the identical situation
-  (its outbox pattern shipped first; the Kafka relay was built as an
-  explicit follow-up once asked for). The transactional outbox write
-  itself is complete and tested; nothing yet delivers those rows to a
-  broker.
-- **KMS integration, migration execution, integration tests against
-  live infrastructure, CI** — all deliberately out of scope for this
-  codegen pass, matching the same boundaries `services/party` drew
-  before its own follow-up phases addressed each one individually.
+- **KMS integration** — deliberately out of scope, same boundary
+  `services/party` draws: this process takes an already-resolved key
+  from an environment variable, and never talks to a KMS itself.
+- ~~A concrete Kafka-backed `outbox.Publisher`~~ — built in a follow-up,
+  see below.
 
 ## Spec version implemented
 
@@ -272,19 +267,15 @@ That gap is now closed, using the same tools and patterns
   → reopen the case that was closed → assign/read a relationship
   manager → default vs. updated communication preferences → run the SLA
   sweep with a fast-forwarded clock and confirm both the case row and a
-  `crm.case.escalated` outbox entry are genuinely written.
-  - Unlike `services/party`'s equivalent, this does **not** also spin up
-    Kafka — CRM has no Kafka-backed outbox publisher yet (see "What's
-    explicitly out of scope" above); the outbox insert itself is
-    verified, but nothing delivers it to a broker in this service.
+  `crm.case.escalated` outbox entry are genuinely written (extended
+  further in the Kafka follow-up below, once the relay existed to test).
   - Required an exported `service.NewWithClock` constructor (not present
     before this follow-up) — the integration test lives in a different
     package than `internal/service`, so it cannot reach the unexported
     `now` field `internal/service`'s own tests set directly. `New`
     (production default) is unaffected.
   - **Verified for real, not just written**: ran twice against a live
-    Colima Docker daemon on this machine — both runs passed
-    (`TestCaseLifecycle_AgainstLivePostgres`, ~1.1–1.4s each), no
+    Colima Docker daemon on this machine — both runs passed, no
     leftover containers afterward.
 - **CI**: `.github/workflows/crm-ci.yml` (new), scoped to
   `services/crm/**` and the CRM specs. Same three-job shape as
@@ -294,3 +285,51 @@ That gap is now closed, using the same tools and patterns
   its own first run (`setup-go` looks for `go.sum` at the repo root by
   default, not the nested module directory) — applied here from the
   start rather than discovered the same way twice.
+
+## Follow-up: Kafka outbox publisher
+
+`internal/outbox.Publisher` had no concrete implementation — domain
+events were durably written to the outbox table transactionally with
+every business write, but nothing ever delivered them. Closed the same
+way `services/party` closed the identical gap:
+
+- `internal/relay` (new package, ported from `services/party`'s —
+  fully generic, `segmentio/kafka-go`, no cgo dependency): polls
+  unpublished outbox rows via the `outbox.Reader` contract already built
+  during the integration-test follow-up (`postgres.Store.ListUnpublished`/
+  `MarkPublished`), writes each to its own Kafka topic, and marks a row
+  published only after the write succeeds — the same at-least-once
+  contract `services/party`'s relay documents.
+- `cmd/crm-service/main.go` — wires a real `*kafkago.Writer` from
+  `CRM_SERVICE_KAFKA_BROKERS` (required, comma-separated) and runs the
+  relay on a ticker (`CRM_SERVICE_OUTBOX_POLL_INTERVAL`, default 2s) in
+  a background goroutine alongside the existing SLA-sweep goroutine.
+- 5 new tests in `internal/relay/kafka_publisher_test.go` (ported from
+  `services/party`, identical coverage: no-op on an empty outbox, each
+  entry written to its own topic then marked published, a write failure
+  marks nothing, a mark-published failure surfaces distinctly from a
+  publish failure, batch size is respected).
+- **`internal/integration/integration_test.go` extended to real
+  Postgres *and* Kafka**, closing the gap the earlier integration-test
+  follow-up explicitly left open. Provisions all 9 `crm.*` topics
+  explicitly (matching how `services/party`'s equivalent test found
+  Kafka's `auto.create.topics.enable` unreliable), then after the SLA
+  sweep: publishes through a real broker, confirms a second publish call
+  finds nothing left (`MarkPublished` genuinely persisted), and consumes
+  the `crm.case.escalated` message back from the real broker to confirm
+  the payload matches the escalated case.
+  - **A real test bug this run caught**: the original version left the
+    case from step 4 (open → update → note → close → reopen) sitting
+    `Open` afterward. `ListCasesPastSLA` scans every case in the store,
+    not just ones the SLA-test `Service` instance created, and that
+    reopened case's freshly reset 24h SLA window landed close enough in
+    time to *also* cross the sweep's fast-forwarded clock alongside the
+    dedicated SLA test case — so the sweep escalated both, and the Kafka
+    consumer read whichever was published first (non-deterministically
+    the wrong one). Fixed by closing that case again after the reopen
+    assertion, which is also the more realistic workflow. Caught by
+    actually running the test, not by inspection — the first live run
+    failed with exactly this symptom before the fix.
+  - **Verified for real**: ran twice against a live Colima Docker
+    daemon after the fix — both passed (~29s each), no leftover
+    containers.
