@@ -1,10 +1,20 @@
 asyncapi: 2.6.0
 info:
   title: General Ledger & Posting Engine Events
-  version: 0.3.0
+  version: 0.4.0
   description: >
     Domain events published by GLPostingAdapter whenever a JournalEntry is
-    posted. One channel serves every posting rule across every epic —
+    posted, or a period is closed. v0.4.0 adds `gl.period.closed`
+    (invariant 7's "period close is a distinct, auditable operation" —
+    Batch/EOD needs to know a period locked, since it drives whether a
+    correction it initiates must go through priorPeriodAdjustmentForPeriodId
+    instead of an ordinary entry). `gl.entry.posted`'s payload also picks
+    up JournalEntry's new required fields (postingRuleVersion, periodId,
+    isPriorPeriodAdjustment, adjustmentForPeriodId) automatically, since it
+    is a $ref to the shared schema, not a locally duplicated one — no event
+    schema change was needed for that part.
+
+    One channel serves every posting rule across every epic —
     consumers filter on `postingRuleCode`. Retrofitted to the API/Event Spec
     Agent's conventions (v0.3.0, BREAKING from v0.2.0): topic renamed from
     `gl.journal-entry.posted.v1` to `gl.entry.posted` (the
@@ -79,6 +89,17 @@ channels:
       message:
         $ref: '#/components/messages/JournalEntryPosted'
 
+  gl.period.closed:
+    description: >
+      Published once, transactionally, the first time a period is closed
+      (not on the idempotent no-op of closing an already-closed period).
+      x-consumers: [BatchEodAdapter]
+    publish:
+      operationId: publishPeriodClosed
+      summary: A period was closed
+      message:
+        $ref: '#/components/messages/PeriodClosed'
+
 components:
   messages:
     JournalEntryPosted:
@@ -87,3 +108,21 @@ components:
       contentType: application/json
       payload:
         $ref: '../schemas/journal-entry.schema.json#/$defs/JournalEntry'
+
+    PeriodClosed:
+      name: PeriodClosed
+      title: Period Closed
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/PeriodClosedPayload'
+
+  schemas:
+    PeriodClosedPayload:
+      type: object
+      required: [periodId, closedAt, closedBy]
+      properties:
+        periodId:
+          type: string
+          pattern: "^[0-9]{4}-(0[1-9]|1[0-2])$"
+        closedAt: { type: string, format: date-time }
+        closedBy: { type: string }

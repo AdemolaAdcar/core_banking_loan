@@ -22,7 +22,7 @@
     },
     "JournalEntry": {
       "type": "object",
-      "required": ["journalEntryId", "sourceEventId", "postingRuleCode", "lines", "balanced", "immutable", "postedAt"],
+      "required": ["journalEntryId", "sourceEventId", "postingRuleCode", "postingRuleVersion", "lines", "balanced", "immutable", "postedAt", "periodId", "isPriorPeriodAdjustment", "adjustmentForPeriodId"],
       "properties": {
         "journalEntryId": { "type": "string", "format": "uuid" },
         "sourceEventId": {
@@ -30,6 +30,10 @@
           "description": "Populated from the caller's Idempotency-Key header value. Every JournalEntry is keyed on this — never reused across two logically different postings."
         },
         "postingRuleCode": { "type": "string" },
+        "postingRuleVersion": {
+          "type": "string",
+          "description": "The exact version of the posting-rule manifest (specs/coa's sibling posting-rule catalog, docs/design-notes.md Appendix B) that produced this entry — so any entry can be explained after the fact even if the rule's logic later changes. Never inferred or backfilled; always the version in effect at posting time."
+        },
         "loanAccountId": { "type": "string", "format": "uuid" },
         "lines": {
           "type": "array",
@@ -44,6 +48,20 @@
           "description": "There is no update or delete operation for this resource. Corrections are always a new, separate entry with a new sourceEventId."
         },
         "postedAt": { "type": "string", "format": "date-time" },
+        "periodId": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])$",
+          "description": "Calendar-month accounting period this entry belongs to, derived from postedAt (YYYY-MM). Once this period is closed, no entry belonging to it may be the target of a reversal — see reversalOfSourceEventId and POST /periods/{periodId}:close."
+        },
+        "isPriorPeriodAdjustment": {
+          "type": "boolean",
+          "description": "True only for a correction entry posted after adjustmentForPeriodId's period was closed. A prior-period adjustment always belongs to the CURRENT open period (periodId reflects when it was posted, not the period it corrects) — this flag plus adjustmentForPeriodId is what preserves the audit trail back to the closed period it corrects."
+        },
+        "adjustmentForPeriodId": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])$",
+          "description": "Set only when isPriorPeriodAdjustment is true — the closed period this entry corrects. Null otherwise."
+        },
         "metadata": {
           "type": "object",
           "additionalProperties": true,

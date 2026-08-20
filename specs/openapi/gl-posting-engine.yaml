@@ -1,13 +1,35 @@
 openapi: 3.1.0
 info:
   title: General Ledger & Posting Engine API
-  version: 0.3.0
+  version: 0.4.0
   description: >
     The ONLY component in the system permitted to write a JournalEntry. Every entry
     is balanced (debits = credits), atomic, immutable, and idempotent, keyed on
     `sourceEventId`. There is no update or delete path — corrections are always a
-    new, separate entry with a new idempotency key. Retrofitted to the API/Event
-    Spec Agent's conventions (v0.3.0, BREAKING from v0.2.0):
+    new, separate entry with a new idempotency key.
+
+    v0.4.0 (BREAKING from v0.3.0) closes a gap the Ledger & Posting Engine Codegen
+    Agent's own invariants (Section 7.3) exposed: this spec previously had zero API
+    surface for a live trial balance, a per-loan-account statement, or an auditable
+    period close, despite those being hard requirements. Adds
+    `postingRuleVersion` (required on every JournalEntry — server-stamped from
+    GL's own currently-active posting-rule catalog version, never caller-supplied,
+    since it documents what logic actually ran), `periodId`/`isPriorPeriodAdjustment`/
+    `adjustmentForPeriodId` (also required on every JournalEntry — periodId is the
+    YYYY-MM calendar period an entry belongs to, derived from postedAt), a new
+    `priorPeriodAdjustmentForPeriodId` request field (postJournalEntry), and three
+    new resources: `GET /trial-balance`, `GET /loan-accounts/{loanAccountId}/statement`,
+    and `GET/POST /periods/{periodId}`. Both new GET endpoints are always computed
+    live from posted entries — invariant 6 explicitly forbids a separately
+    maintained running total that could drift from the journal, so neither reads
+    from any cache or materialized aggregate. Closing a period
+    (`POST /periods/{periodId}:close`) blocks `postJournalEntry` from accepting a
+    `reversalOfSourceEventId` that targets an entry in that period — the 422
+    response for that case now names this explicitly, alongside the pre-existing
+    "target entry doesn't exist" case; a correction after close posts as a new
+    current-period entry via `priorPeriodAdjustmentForPeriodId` instead.
+
+    Retrofitted to the API/Event Spec Agent's conventions (v0.3.0, BREAKING from v0.2.0):
     (1) Money fields are now the shared {amount: integer minor-units, currency}
     object (../schemas/money.schema.json), never a bare float — every prior
     `amount: number` / `currency: string` pair is replaced.
@@ -262,7 +284,14 @@ paths:
             application/json:
               schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
         '422':
-          description: postingRuleCode = PR-DISB-02, PR-REPAY-02, or PR-DELINQ-02 but reversalOfSourceEventId does not reference an existing posted entry
+          description: >-
+            postingRuleCode = PR-DISB-02, PR-REPAY-02, or PR-DELINQ-02 but
+            reversalOfSourceEventId does not reference an existing posted
+            entry, OR reversalOfSourceEventId references an entry whose
+            period has already been closed (post a new entry with
+            priorPeriodAdjustmentForPeriodId instead), OR
+            priorPeriodAdjustmentForPeriodId references a period that is
+            not Closed.
           content:
             application/json:
               schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
@@ -382,8 +411,174 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /trial-balance:
+    get:
+      operationId: getTrialBalance
+      summary: Live trial balance across every GL account, computed from posted entries
+      description: >
+        Invariant 6: always computed live by summing every posted
+        JournalEntryLine as of `asOf` — never read from a separately
+        maintained running total that could drift from the journal. Every
+        account's debitTotal/creditTotal is a genuine SUM aggregate query
+        at request time. totalDebits always equals totalCredits, by
+        construction: each individual posted entry already balances
+        (invariant 1), so the sum of any set of balanced entries balances
+        too.
+      tags: [TrialBalance]
+      parameters:
+        - name: asOf
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Defaults to now if omitted.
+      responses:
+        '200':
+          description: Trial balance as of the given instant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrialBalance'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /loan-accounts/{loanAccountId}/statement:
+    get:
+      operationId: getStatementOfAccount
+      summary: Every posted line referencing a loan account, computed live from posted entries
+      description: >
+        Invariant 6: computed live from the journal on every call, same
+        discipline as getTrialBalance — never a cached/materialized
+        statement. Lines are returned oldest-first; each line already
+        carries runningBalanceAfter from JournalEntryLine, so this
+        endpoint never needs to separately compute or store a running
+        total either.
+      tags: [TrialBalance]
+      parameters:
+        - name: loanAccountId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: asOf
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Defaults to now if omitted.
+      responses:
+        '200':
+          description: Statement of account as of the given instant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementOfAccount'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: loanAccountId has no posted entries
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /periods/{periodId}:
+    get:
+      operationId: getPeriod
+      summary: Retrieve a period's close status
+      tags: [PeriodClose]
+      parameters:
+        - $ref: '#/components/parameters/PeriodId'
+      responses:
+        '200':
+          description: Current period status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Period'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No period with that ID has ever had an entry posted or been explicitly closed
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /periods/{periodId}:close:
+    post:
+      operationId: closePeriod
+      summary: Close a period — invariant 7's distinct, auditable operation
+      description: >
+        Once closed, postJournalEntry refuses (422) any
+        reversalOfSourceEventId targeting an entry in this period — a
+        correction after close must be posted as a new current-period
+        entry via priorPeriodAdjustmentForPeriodId instead. Periods must
+        close in chronological order: closing periodId is refused (409)
+        if any earlier period is still Open. Idempotent on the
+        Idempotency-Key header AND idempotent on repeated calls against
+        an already-closed period (returns the original close record,
+        closes nothing again) — closing is a one-way operation, there is
+        no reopen.
+      tags: [PeriodClose]
+      parameters:
+        - $ref: '#/components/parameters/PeriodId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClosePeriodRequest'
+      responses:
+        '200':
+          description: Period closed (or already closed — idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Period'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: An earlier period is still Open — periods must close in chronological order
+          content:
+            application/json:
+              schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   parameters:
+    PeriodId:
+      name: periodId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[0-9]{4}-(0[1-9]|1[0-2])$"
+      description: Calendar-month period, YYYY-MM.
+
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -408,6 +603,9 @@ components:
             gl:journal-entry:write: Post journal entries
             gl:journal-entry:read: Read journal entries
             gl:account-balance:read: Read GL control account balances
+            gl:trial-balance:read: Read the live trial balance and per-loan-account statements
+            gl:period:read: Read period close status
+            gl:period:write: Close a period
 
   responses:
     BadRequest:
@@ -448,6 +646,75 @@ components:
         asOf:
           type: string
           format: date-time
+
+    TrialBalanceAccountLine:
+      type: object
+      required: [glAccountCode, debitTotal, creditTotal]
+      properties:
+        glAccountCode: { type: string }
+        debitTotal: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        creditTotal: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+
+    TrialBalance:
+      type: object
+      required: [asOf, accounts, totalDebits, totalCredits]
+      properties:
+        asOf:
+          type: string
+          format: date-time
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrialBalanceAccountLine'
+        totalDebits: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        totalCredits: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+
+    StatementLine:
+      type: object
+      required: [journalEntryId, postedAt, postingRuleCode, glAccount, direction, amount, runningBalanceAfter]
+      properties:
+        journalEntryId: { type: string, format: uuid }
+        postedAt: { type: string, format: date-time }
+        postingRuleCode: { type: string }
+        glAccount: { type: string }
+        direction: { type: string, enum: [DEBIT, CREDIT] }
+        amount: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+        runningBalanceAfter: { $ref: '../schemas/money.schema.json#/$defs/Money' }
+
+    StatementOfAccount:
+      type: object
+      required: [loanAccountId, asOf, lines]
+      properties:
+        loanAccountId: { type: string, format: uuid }
+        asOf:
+          type: string
+          format: date-time
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatementLine'
+          description: Oldest first.
+
+    Period:
+      type: object
+      required: [periodId, status]
+      properties:
+        periodId:
+          type: string
+          pattern: "^[0-9]{4}-(0[1-9]|1[0-2])$"
+        status:
+          type: string
+          enum: [Open, Closed]
+        closedAt: { type: ["string", "null"], format: date-time }
+        closedBy: { type: ["string", "null"] }
+
+    ClosePeriodRequest:
+      type: object
+      required: [closedBy]
+      properties:
+        closedBy:
+          type: string
+          description: Identity of the requesting operator/system.
 
     Allocation:
       type: object
@@ -525,7 +792,29 @@ components:
           $ref: '#/components/schemas/Capitalization'
         reversalOfSourceEventId:
           type: string
-          description: Required when postingRuleCode = PR-DISB-02, PR-REPAY-02, or PR-DELINQ-02; must reference an already-posted sourceEventId (the target entry's original Idempotency-Key value).
+          description: >-
+            Required when postingRuleCode = PR-DISB-02, PR-REPAY-02, or
+            PR-DELINQ-02; must reference an already-posted sourceEventId
+            (the target entry's original Idempotency-Key value). May
+            itself reference an entry that was already a reversal (a
+            reversal of a reversal is valid and produces an entry
+            mirroring the referenced entry's lines with direction
+            flipped) — reversalOfSourceEventId always points at the
+            entry being directly undone, never chained back further than
+            one hop. Refused (422) if the target entry's period is
+            closed — see priorPeriodAdjustmentForPeriodId.
+        priorPeriodAdjustmentForPeriodId:
+          type: ["string", "null"]
+          pattern: "^[0-9]{4}-(0[1-9]|1[0-2])$"
+          description: >-
+            Invariant 7: set only when this entry is a correction for a
+            period that has already been closed. The resulting entry
+            still belongs to the CURRENT open period (its own periodId
+            reflects when it was actually posted) but carries
+            isPriorPeriodAdjustment=true and adjustmentForPeriodId set to
+            this value. Refused (422) if the referenced period is not
+            Closed — an adjustment for a still-open period is just an
+            ordinary entry, this field is not for that case.
         metadata:
           type: object
           additionalProperties: true

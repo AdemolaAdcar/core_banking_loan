@@ -1,0 +1,70 @@
+{
+  "version": "1.0.0",
+  "description": "Chart of Accounts for the General Ledger & Posting Engine. This is the first time this manifest has existed as a committed artifact — no prior COA file existed anywhere in this repo; only 8 bare account-name strings appeared in journal-entry.schema.json's glAccount description as an illustrative example. This manifest makes those same 8 accounts (and only those 8 — no account is invented here beyond what the 11 approved posting rules in docs/design-notes.md Appendix B already reference) the authoritative, machine-readable source of account codes, types, and normal balance sides. services/gl/internal/coa embeds this file directly (go:embed) as its single source of truth; the Postgres migration's CHECK constraint / trigger validates every posted line's glAccount against this same set.",
+  "accounts": [
+    {
+      "code": "1010",
+      "name": "CashNostro",
+      "type": "ASSET",
+      "normalBalance": "DEBIT",
+      "contraAsset": false,
+      "description": "Bank/nostro cash position. Debited on disbursement, repayment, and payoff; credited on disbursement reversal."
+    },
+    {
+      "code": "1200",
+      "name": "LoanReceivable",
+      "type": "ASSET",
+      "normalBalance": "DEBIT",
+      "contraAsset": false,
+      "description": "Outstanding principal owed by the borrower. Debited on disbursement and loan-term-modification capitalization; credited on repayment/payoff principal allocation and charge-off."
+    },
+    {
+      "code": "1300",
+      "name": "InterestReceivable",
+      "type": "ASSET",
+      "normalBalance": "DEBIT",
+      "contraAsset": false,
+      "description": "Accrued interest owed by the borrower, not yet collected. Debited on daily accrual; credited on repayment/payoff interest allocation, charge-off, and modification capitalization."
+    },
+    {
+      "code": "1400",
+      "name": "FeeReceivable",
+      "type": "ASSET",
+      "normalBalance": "DEBIT",
+      "contraAsset": false,
+      "description": "Assessed fees (e.g. late fees) owed by the borrower, not yet collected. Debited on delinquency fee assessment; credited on repayment fee allocation, an authorized fee waiver, and modification capitalization."
+    },
+    {
+      "code": "1900",
+      "name": "AllowanceForLoanLosses",
+      "type": "ASSET",
+      "normalBalance": "CREDIT",
+      "contraAsset": true,
+      "description": "Contra-asset reserve against expected loan losses — carries a natural CREDIT balance, opposite every other account in the 1xxx (Asset) range. Debited on charge-off. KNOWN GAP, carried forward unresolved from an earlier phase and still true as of this manifest: no posting rule in the current 11-rule catalog ever CREDITS (funds/provisions) this account — see services/gl/PR_DESCRIPTION.md for the full flag. This manifest documents the account's correct accounting nature; it does not by itself fix the missing provisioning rule, which is a Chart of Accounts & Posting Rules Agent / Ledger & Solution Architect Agent decision outside this codegen role's authority."
+    },
+    {
+      "code": "4100",
+      "name": "InterestIncome",
+      "type": "INCOME",
+      "normalBalance": "CREDIT",
+      "contraAsset": false,
+      "description": "Recognized interest income. Credited on daily accrual."
+    },
+    {
+      "code": "4200",
+      "name": "FeeIncome",
+      "type": "INCOME",
+      "normalBalance": "CREDIT",
+      "contraAsset": false,
+      "description": "Recognized fee income. Credited on delinquency fee assessment; debited on an authorized fee waiver."
+    },
+    {
+      "code": "4300",
+      "name": "RecoveryIncome",
+      "type": "INCOME",
+      "normalBalance": "CREDIT",
+      "contraAsset": false,
+      "description": "Recognized income from recovering funds against a previously charged-off account. Credited on a post-charge-off recovery."
+    }
+  ]
+}
