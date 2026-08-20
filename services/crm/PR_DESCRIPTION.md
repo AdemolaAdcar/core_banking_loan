@@ -236,3 +236,61 @@ require a live Postgres instance (and, for `main.go`, a live JWKS
 endpoint) to exercise meaningfully; that is integration-test territory,
 out of scope for this change (see `services/party/internal/integration`
 for the pattern this service would follow if asked to add the same).
+
+## Follow-up: migration runner, integration test, and CI
+
+The initial pass above deliberately left the migration runner unused
+(never actually run against `migrations/*.sql`), no integration test
+against live infrastructure, and no CI at all — matching the exact
+boundaries `services/party` drew before its own equivalent follow-up.
+That gap is now closed, using the same tools and patterns
+`services/party` already established:
+
+- **Migration runner**: [golang-migrate](https://github.com/golang-migrate/migrate),
+  same as `services/party`. Verified for real: ran `up`, `version`,
+  `down`, `up` again against a disposable local Postgres container and
+  confirmed all 9 expected tables (`cases`, `interactions`, `case_notes`,
+  `case_note_access_log`, `communication_preferences`,
+  `relationship_manager_assignments`, `loan_account_links`, `outbox`,
+  `idempotency_keys`, plus `golang-migrate`'s own `schema_migrations`)
+  appear after `up` and are fully removed after `down`.
+- `services/crm/Makefile` — identical target set to `services/party`'s:
+  `build`, `vet`, `fmt-check`, `test`, `test-integration`,
+  `migrate-up`/`down`/`version`/`force`.
+- **Integration test**: `internal/integration/integration_test.go` (build
+  tag `integration`) spins up a disposable Postgres via
+  `testcontainers-go`, applies the real migration, and runs one
+  comprehensive lifecycle against it: open a case → **prove the
+  database-level optimistic-concurrency guard** (`UpdateCaseConditional`'s
+  `WHERE version = $N`) actually rejects a stale-version concurrent
+  update, not just the in-memory check a fake store could pass even if
+  the real SQL were broken → add a case note and confirm it round-trips
+  through **real** AES-GCM encryption (and query the raw column directly
+  to confirm the body is genuinely not stored in plaintext) → confirm
+  the read-access-log row actually lands → close (idempotent) → confirm
+  reopening a case that was never closed fails against the real database
+  → reopen the case that was closed → assign/read a relationship
+  manager → default vs. updated communication preferences → run the SLA
+  sweep with a fast-forwarded clock and confirm both the case row and a
+  `crm.case.escalated` outbox entry are genuinely written.
+  - Unlike `services/party`'s equivalent, this does **not** also spin up
+    Kafka — CRM has no Kafka-backed outbox publisher yet (see "What's
+    explicitly out of scope" above); the outbox insert itself is
+    verified, but nothing delivers it to a broker in this service.
+  - Required an exported `service.NewWithClock` constructor (not present
+    before this follow-up) — the integration test lives in a different
+    package than `internal/service`, so it cannot reach the unexported
+    `now` field `internal/service`'s own tests set directly. `New`
+    (production default) is unaffected.
+  - **Verified for real, not just written**: ran twice against a live
+    Colima Docker daemon on this machine — both runs passed
+    (`TestCaseLifecycle_AgainstLivePostgres`, ~1.1–1.4s each), no
+    leftover containers afterward.
+- **CI**: `.github/workflows/crm-ci.yml` (new), scoped to
+  `services/crm/**` and the CRM specs. Same three-job shape as
+  `party-ci.yml`: `build-test`, `migrations` (real Postgres service
+  container, verifies `up`→`down`→`up`), `integration-test`. Carries
+  forward the `cache-dependency-path` fix `party-ci.yml` needed after
+  its own first run (`setup-go` looks for `go.sum` at the repo root by
+  default, not the nested module directory) — applied here from the
+  start rather than discovered the same way twice.

@@ -1,0 +1,105 @@
+name: CRM CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/crm/**"
+      - "specs/openapi/crm.yaml"
+      - "specs/asyncapi/crm-events.yaml"
+      - "specs/schemas/service-case.schema.json"
+      - ".github/workflows/crm-ci.yml"
+  pull_request:
+    paths:
+      - "services/crm/**"
+      - "specs/openapi/crm.yaml"
+      - "specs/asyncapi/crm-events.yaml"
+      - "specs/schemas/service-case.schema.json"
+      - ".github/workflows/crm-ci.yml"
+
+defaults:
+  run:
+    working-directory: services/crm
+
+# golang-migrate CLI version pinned for reproducibility -- bump
+# deliberately, not via @latest, so CI doesn't silently pick up a new
+# major version's breaking CLI changes. Kept in sync with party-ci.yml's
+# pinned version.
+env:
+  MIGRATE_VERSION: v4.19.1
+
+jobs:
+  build-test:
+    name: Build, vet, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/crm/go.mod
+          cache-dependency-path: services/crm/go.sum
+      - run: go build ./...
+      - run: go vet ./...
+      - name: gofmt check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+      - run: go test ./... -v
+
+  migrations:
+    name: Migration runner (up / down / up)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: crm
+          POSTGRES_PASSWORD: crm
+          POSTGRES_DB: crm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://crm:crm@localhost:5432/crm?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/crm/go.mod
+          cache-dependency-path: services/crm/go.sum
+      - name: Put $(go env GOPATH)/bin on PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Install golang-migrate CLI
+        run: go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@${{ env.MIGRATE_VERSION }}
+      - name: migrate up (from empty database)
+        run: make migrate-up
+      - name: migrate version
+        run: make migrate-version
+      - name: migrate down (verify every down migration actually reverses cleanly)
+        run: make migrate-down
+      - name: migrate up again (verify re-applying from clean is still correct)
+        run: make migrate-up
+
+  integration-test:
+    name: Integration test (live Postgres via testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/crm/go.mod
+          cache-dependency-path: services/crm/go.sum
+      # ubuntu-latest runners ship Docker pre-installed and running --
+      # no DOCKER_HOST/socket overrides needed here (those are only
+      # required for local Colima setups; see PR_DESCRIPTION.md). Unlike
+      # party-ci.yml's equivalent job, this doesn't need a Kafka
+      # container -- CRM has no Kafka-backed outbox publisher yet.
+      - run: make test-integration

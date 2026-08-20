@@ -32,6 +32,19 @@ func New(s store.Store) *Service {
 	}
 }
 
+// NewWithClock builds a Service with an overridable clock. Exported
+// specifically so tests in other packages (see
+// internal/integration/integration_test.go) can fast-forward time to
+// exercise SLA-escalation logic against a real store without an actual
+// 24h+ wait — internal/service's own tests already do this by setting
+// the unexported `now` field directly, which only works from inside this
+// package. Production code should always use New, never this.
+func NewWithClock(s store.Store, now func() time.Time) *Service {
+	svc := New(s)
+	svc.now = now
+	return svc
+}
+
 // --- Interaction logging --------------------------------------------------
 
 type LogInteractionInput struct {
