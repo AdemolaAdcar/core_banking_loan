@@ -135,7 +135,8 @@ container before anything was built on top of them:
 
 ## Unit tests written, organized by invariant and required edge case
 
-**77 tests total** across `internal/coa`, `internal/domain`,
+**79 tests total** (including the two `ErrCurrentPeriodClosed` tests
+added in the follow-up below) across `internal/coa`, `internal/domain`,
 `internal/postingrules`, `internal/auth`, `internal/service`, and
 `internal/api` — `go build ./...`, `go vet ./...`, `gofmt -l .` (clean),
 `go test ./...`, and `go test -race ./...` all pass.
@@ -270,3 +271,67 @@ container before anything was built on top of them:
   (`TestGetJournalEntry_NotFound_404`, `TestFindBySourceEvent_RoundTrips`,
   `TestGetAccountBalance_UnknownAccount_404`,
   `TestGetTrialBalance_ReflectsPostedEntries`).
+
+## Follow-up: migration runner, integration test, and CI
+
+Closes the same gap already closed for `services/party` and
+`services/crm`: `services/gl/Makefile` (identical target set), the
+migration runner re-verified through the actual `golang-migrate` CLI
+this time (the initial pass verified the trigger/GRANT behavior with
+raw `psql` only) — `up`/`version`/`down`/`up` against a disposable
+Postgres, confirming all 6 expected tables (`journal_entries`,
+`journal_entry_lines`, `periods`, `outbox`, `idempotency_keys`, plus
+`golang-migrate`'s own `schema_migrations`) appear and are fully
+removed.
+
+**Integration test** (`internal/integration/integration_test.go`, build
+tag `integration`) goes further than the other two services' equivalents
+for one specific reason: this is the one service where the database
+invariants ARE the point, so this test authenticates as `gl_app` (the
+actual restricted role `cmd/gl-service` uses in production, not an
+admin/superuser role) and exercises both database-level invariants
+through the real application code path for the first time — previously
+only verified with raw `psql` run by hand:
+
+- Posts a real entry through `internal/service` → `internal/store/postgres`
+  → Postgres, authenticated as `gl_app`.
+- **Invariant 1, live, through the app's own connection**: hand-crafts an
+  intentionally unbalanced entry via a direct SQL transaction (bypassing
+  `internal/domain` entirely) and confirms the database's own deferred
+  constraint trigger rejects it at `COMMIT`, with the whole transaction
+  rolled back (`SELECT count(*) ... = 0` afterward).
+- **Invariant 3, live, through the app's own connection**: confirms
+  `UPDATE`/`DELETE` against `journal_entries`/`journal_entry_lines` both
+  fail for `gl_app`.
+- Posts a reversal, confirms it mirrors the original.
+- Closes the current period, then confirms an ordinary posting into it
+  is now rejected, and that a prior-period adjustment against that same
+  closed period still succeeds.
+- Confirms the live trial balance always balances.
+
+**A real gap this integration test's own design surfaced, fixed before
+the test was finalized** (not found by running it — found while
+deciding what the test *should* assert): invariant 7's literal text only
+says period close "locks prior-period entries from reversal." Nothing
+previously stopped an *ordinary* (non-reversal, non-adjustment) posting
+from landing in an already-closed period if wall-clock "now" still fell
+within it — a real race between a close operation and a straggling
+request, or clock skew. Added `service.ErrCurrentPeriodClosed`: any
+posting that isn't explicitly a prior-period adjustment now checks its
+own would-be `periodId` against `Closed` and refuses if so (new 422
+case, documented in `gl-posting-engine.yaml`). Two new unit tests
+(`TestPostJournalEntry_OrdinaryPostingIntoClosedCurrentPeriod_Rejected`,
+`TestPostJournalEntry_PriorPeriodAdjustment_StillAllowedWhenCurrentPeriodClosed`)
+plus the integration test itself now cover this.
+
+**CI**: `.github/workflows/gl-ci.yml` (new), scoped to `services/gl/**`
+and the GL specs (including `specs/coa/**`). Same three-job shape as
+`party-ci.yml`/`crm-ci.yml`, with one addition: `build-test` also runs
+`go test -race ./...` as a separate step — the concurrent-posting edge
+case matters more here than anywhere else in this repo, so CI checks it
+on every push, not just when someone remembers to run it locally.
+
+**Verified for real, not just written**: ran the integration test twice
+against a live Colima Docker daemon on this machine after the
+`ErrCurrentPeriodClosed` fix — both passed (~1.1–1.3s each), no leftover
+containers.

@@ -256,6 +256,60 @@ func TestGetAccountBalance_UnknownAccount_NotFound(t *testing.T) {
 // prior-period adjustments
 // =========================================================================
 
+// TestPostJournalEntry_OrdinaryPostingIntoClosedCurrentPeriod_Rejected
+// covers a gap invariant 7's literal text doesn't name explicitly (it
+// only says "locks prior-period entries from REVERSAL") but its intent
+// clearly requires: once a period is closed, it must never silently
+// receive a brand-new, non-adjustment posting either -- not just protect
+// against reversal. A new entry's own periodId is always derived from
+// now(), so this can only happen via a race between a close operation
+// and a request timestamped into the period being closed (or clock
+// skew) -- still a real scenario for a financial ledger, and one this
+// service now closes.
+func TestPostJournalEntry_OrdinaryPostingIntoClosedCurrentPeriod_Rejected(t *testing.T) {
+	fs := newFakeStore()
+	s := newTestService(fs) // clock fixed at 2026-08-20
+	if _, err := s.ClosePeriod(context.Background(), "2026-08", "ops.analyst"); err != nil {
+		t.Fatalf("unexpected error closing the current period: %v", err)
+	}
+
+	_, err := s.PostJournalEntry(context.Background(), disbInput("disb:straggler", "loan-1", 1500000))
+	if !errors.Is(err, ErrCurrentPeriodClosed) {
+		t.Fatalf("expected ErrCurrentPeriodClosed, got %v", err)
+	}
+}
+
+func TestPostJournalEntry_PriorPeriodAdjustment_StillAllowedWhenCurrentPeriodClosed(t *testing.T) {
+	fs := newFakeStore()
+	julySvc := NewWithClock(fs, coa.MustLoad(), fixedClock(time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)))
+	julySvc.newID = sequentialIDs("je-jul")
+	if _, err := julySvc.ClosePeriod(context.Background(), "2026-07", "ops.analyst"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The CURRENT period (August) is also closed -- an ordinary posting
+	// would be rejected, but a prior-period adjustment explicitly
+	// targeting the closed July period must still succeed.
+	augustSvc := NewWithClock(fs, coa.MustLoad(), fixedClock(time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)))
+	augustSvc.newID = sequentialIDs("je-aug")
+	if _, err := augustSvc.ClosePeriod(context.Background(), "2026-08", "ops.analyst"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	amt := usd(2500)
+	julyPeriod := "2026-07"
+	out, err := augustSvc.PostJournalEntry(context.Background(), PostJournalEntryInput{
+		IdempotencyKey: "correction:1", PostingRuleCode: postingrules.PRDELINQ01, LoanAccountID: "loan-1",
+		Amount: &amt, PriorPeriodAdjustmentForPeriodID: &julyPeriod,
+	})
+	if err != nil {
+		t.Fatalf("expected a prior-period adjustment to succeed even though the current period is also closed, got: %v", err)
+	}
+	if out.PeriodID != "2026-08" {
+		t.Fatalf("expected the adjustment entry to belong to August, got %s", out.PeriodID)
+	}
+}
+
 func TestPostJournalEntry_ReversalOfClosedPeriodEntry_Rejected(t *testing.T) {
 	fs := newFakeStore()
 	julyClock := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)

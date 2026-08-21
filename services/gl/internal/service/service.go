@@ -59,6 +59,7 @@ var (
 	ErrReversalTargetPeriodClosed = errors.New("service: cannot reverse an entry in a closed period; post a prior-period adjustment instead")
 	ErrReversalAmountMismatch     = errors.New("service: reversal amount does not match the original entry")
 	ErrAdjustmentPeriodNotClosed  = errors.New("service: priorPeriodAdjustmentForPeriodId does not reference a closed period")
+	ErrCurrentPeriodClosed        = errors.New("service: the current period is closed; use priorPeriodAdjustmentForPeriodId to post a correction")
 )
 
 // PostJournalEntryInput mirrors PostJournalEntryRequest exactly one of
@@ -104,6 +105,19 @@ func (s *Service) PostJournalEntry(ctx context.Context, in PostJournalEntryInput
 	now := s.now()
 	if err := s.validatePriorPeriodAdjustment(ctx, in.PriorPeriodAdjustmentForPeriodID); err != nil {
 		return domain.JournalEntry{}, err
+	}
+	// An ordinary posting's own periodId is always derived from now() --
+	// the only way it could land in an already-Closed period is a race
+	// between a close operation and a straggling request timestamped
+	// just before it, or a clock skew. Invariant 7's literal text only
+	// names reversal, but "period close is a distinct, auditable
+	// operation" clearly implies a closed period never silently
+	// receives ANY new posting -- a correction must go through
+	// PriorPeriodAdjustmentForPeriodID instead, same as a reversal must.
+	if in.PriorPeriodAdjustmentForPeriodID == nil {
+		if err := s.rejectIfPeriodClosed(ctx, domain.PeriodID(now), ErrCurrentPeriodClosed); err != nil {
+			return domain.JournalEntry{}, err
+		}
 	}
 
 	journalLines, err := s.attachRunningBalances(ctx, in.LoanAccountID, lines)

@@ -108,6 +108,8 @@ func writePostJournalEntryError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusUnprocessableEntity, "REVERSAL_AMOUNT_MISMATCH", err.Error())
 	case errors.Is(err, service.ErrAdjustmentPeriodNotClosed):
 		writeError(w, http.StatusUnprocessableEntity, "ADJUSTMENT_PERIOD_NOT_CLOSED", err.Error())
+	case errors.Is(err, service.ErrCurrentPeriodClosed):
+		writeError(w, http.StatusUnprocessableEntity, "CURRENT_PERIOD_CLOSED", err.Error())
 	default:
 		// Covers domain.ErrUnbalanced / domain.ErrMultiCurrency and any
 		// other domain-level validation error (e.g. multi-currency

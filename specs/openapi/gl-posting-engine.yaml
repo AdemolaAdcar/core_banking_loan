@@ -291,7 +291,12 @@ paths:
             period has already been closed (post a new entry with
             priorPeriodAdjustmentForPeriodId instead), OR
             priorPeriodAdjustmentForPeriodId references a period that is
-            not Closed.
+            not Closed, OR priorPeriodAdjustmentForPeriodId is absent and
+            the period this entry would otherwise belong to (derived from
+            the current instant) is already Closed — a race between a
+            close operation and this request; retry with
+            priorPeriodAdjustmentForPeriodId once the correct current
+            period is known.
           content:
             application/json:
               schema: { $ref: '../schemas/error.schema.json#/$defs/Error' }
