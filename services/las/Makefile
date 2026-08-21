@@ -28,9 +28,9 @@ test:
 	go test ./...
 
 # Requires a working Docker daemon -- spins up its own disposable
-# Postgres container via testcontainers-go. Not yet added in this
-# increment -- see PR_DESCRIPTION.md's follow-up section, same rhythm as
-# every prior service's integration-test phase.
+# Postgres container via testcontainers-go (see internal/integration).
+# GLPostingAPI itself is stubbed with glclient.Fake, not live -- see
+# PR_DESCRIPTION.md for why a live GL is out of scope for this pass.
 test-integration:
 	go test -tags=integration ./internal/integration/... -v
 

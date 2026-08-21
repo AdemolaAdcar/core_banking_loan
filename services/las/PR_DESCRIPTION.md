@@ -259,20 +259,81 @@ struct-tag/map-literal alignment — cosmetic only, caught by `gofmt -l .`,
 fixed with `gofmt -w`. `go build ./...`, `go vet ./...`, `gofmt -l .`
 (clean), and `go test ./...` all pass.
 
-## Follow-up, not yet started
+## Follow-up: migration runner, integration test, and CI
 
-Matching the exact sequence every other service in this repo has gone
-through after its first codegen pass:
+Closes the same gap already closed for `services/party`, `services/crm`,
+and `services/gl`: `golang-migrate` CLI (pinned `v4.19.1`) re-verified
+against a disposable Postgres — `up` (from empty, 13 application tables
+plus `golang-migrate`'s own `schema_migrations`) / `version` / `down 1`
+(clean removal back to just `schema_migrations`) / `up` again (clean
+reapply) — all confirmed locally.
 
-1. **Migration runner verification** via the actual `golang-migrate` CLI
-   (`up`/`version`/`down`/`up` against a disposable Postgres) — the
-   schema and `Makefile` targets exist but this has not been run yet.
-2. **Integration test** against live Postgres (and likely a fake or real
-   GL endpoint, since this service's own correctness depends on
-   GLPostingAPI's responses) — `internal/integration/` does not exist
-   yet; `make test-integration` currently has nothing to run.
-3. **`.github/workflows/las-ci.yml`** — same three-job shape
-   (`build-test`/`migrations`/`integration-test`) as
-   `party-ci.yml`/`crm-ci.yml`/`gl-ci.yml`.
-4. **Kafka outbox publisher** wiring (`internal/relay`, ported from the
-   other three services).
+**Integration test** (`internal/integration/integration_test.go`, build
+tag `integration`, new) exercises the full write path against a real
+Postgres for the first time — nothing before this had ever actually run
+`migrations/0001_init.up.sql` or exercised `internal/store/postgres`'s
+real SQL, including its `ON CONFLICT` upsert clauses. GLPostingAPI itself
+is **not** live in this test — `glclient.Fake` stands in for it, exactly
+as it does in every `internal/service` unit test, since this service's
+own scope is the state machine, persistence, and balance projection, not
+GL's posting logic (no live LAS+GL integration exists in this repo yet):
+
+- Books a loan account through the real SQL path, confirms the idempotent
+  replay path resolves through the database's `UNIQUE(approval_reference_id)`
+  constraint (`FindLoanAccountByApprovalReference`), not just an in-memory
+  map.
+- Disburses, confirms the account's status transition and the
+  disbursement's `journalEntryId` are both actually persisted and
+  re-readable.
+- Posts an ordinary repayment, then proves the `balance_projections`
+  table's `ON CONFLICT ... DO UPDATE` path specifically (not just its
+  initial `INSERT`) by forcing a second `RefreshBalanceProjection` call
+  after updating the fake GL statement, and confirming the UPDATED
+  projection round-trips through real Postgres.
+- Applies a capitalization modification, confirms a second `term_versions`
+  row is actually persisted (`ListTermVersions` returns 2, not 1).
+- Records a charge-off, then a recovery against the now-`ChargedOff`
+  account, confirming both the status transition and the recovery row
+  persist correctly.
+- Confirms every expected outbox topic (`loan.account.booked`,
+  `loan.account.disbursed`, `loan.repayment.posted`,
+  `loan.terms.modified`, `loan.account.chargedoff`) actually landed as an
+  unpublished row.
+- **`las_app`'s GRANTs, verified live for the first time**: confirms a
+  `DELETE` against `loan_accounts` is rejected for the `las_app`
+  connection — the migration documents "no DELETE grant on any table,"
+  previously asserted only by reading the SQL, never exercised against a
+  real Postgres. This is **not** a ledger-immutability invariant the way
+  GL's is (`migrations/0001_init.up.sql`'s doc comment is explicit: LAS's
+  mutable entity tables have UPDATE granted, unlike GL's append-only
+  `journal_entries`) — it only proves rows can't be silently deleted.
+
+**A test bug caught before it could misreport a real defect**: the first
+draft of the repayment-projection assertion expected the persisted
+principal to drop immediately after the repayment posted, and failed.
+The cause was the test's own fake GL client, not the service:
+`glclient.Fake.Statements` is a static double that doesn't auto-append a
+newly-posted line the way a real GL would on its next read. Fixed by
+updating the fake statement explicitly after the posting (simulating
+what a real GL's statement would show) and forcing a second refresh —
+which, as a side effect, is a strictly better test than the original
+(it now exercises the UPSERT's UPDATE branch, not just its INSERT
+branch).
+
+**CI**: `.github/workflows/las-ci.yml` (new), scoped to `services/las/**`
+and the LAS specs. Same three-job shape as
+`party-ci.yml`/`crm-ci.yml`/`gl-ci.yml`, with `build-test` also running
+`go test -race ./...` as a separate step — this service posts money to
+GL under potential concurrent load (disbursement confirmations, batch
+accrual/delinquency runs), same rationale as `gl-ci.yml`.
+
+**Verified for real, not just written**: ran the integration test twice
+against a live Colima Docker daemon on this machine — both passed
+(~1.1–1.3s each), no leftover containers.
+
+## Still not started
+
+- **Kafka outbox publisher** wiring (`internal/relay`, ported from the
+  other three services) — the transactional outbox write is complete and
+  now proven live against real Postgres; nothing yet delivers those rows
+  to a broker.
