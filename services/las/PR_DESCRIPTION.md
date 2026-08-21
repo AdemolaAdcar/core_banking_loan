@@ -331,9 +331,35 @@ accrual/delinquency runs), same rationale as `gl-ci.yml`.
 against a live Colima Docker daemon on this machine — both passed
 (~1.1–1.3s each), no leftover containers.
 
-## Still not started
+## Follow-up: Kafka outbox publisher
 
-- **Kafka outbox publisher** wiring (`internal/relay`, ported from the
-  other three services) — the transactional outbox write is complete and
-  now proven live against real Postgres; nothing yet delivers those rows
-  to a broker.
+`internal/relay` (new, ported near-verbatim from `services/party`/
+`services/crm`) — `Publisher.PublishUnpublished` reads a batch of
+unpublished outbox rows via `outbox.Reader`, writes each to its own
+topic on a shared `*kafkago.Writer` (every `loan.*`/`delinquency.*`/
+`payment.match.failed` event type shares one `Writer`; `Topic` is
+deliberately left unset on it since kafka-go rejects a Writer with both
+a fixed `Topic` and per-message topics), and only marks a row published
+after the Kafka write succeeds — nothing is marked published if the
+write fails, so a crash or broker outage between the two just means the
+same rows are safely retried on the next poll (at-least-once, matching
+every other topic in this system). 5 unit tests against fake
+reader/writer doubles (empty outbox is a no-op; each entry lands on its
+own topic then gets marked published; a write failure marks nothing
+published; a mark-published failure after a successful write still
+surfaces as an error; batch size is respected).
+
+Wired into `cmd/las-service/main.go`: `LAS_SERVICE_KAFKA_BROKERS`
+(comma-separated, required) builds the `*kafkago.Writer`;
+`runOutboxRelay` polls on `LAS_SERVICE_OUTBOX_POLL_INTERVAL` (default
+2s) in a background goroutine for the process lifetime, logging but
+never treating a publish error as fatal — same pattern as
+`crm-service`'s relay wiring.
+
+**Not yet done**: the integration test (`internal/integration/`) still
+only proves the transactional outbox WRITE lands in Postgres — it does
+not yet spin up a live Kafka broker to prove `internal/relay` actually
+delivers a message end to end, the way `services/crm`'s integration test
+does. Flagged rather than silently assumed equivalent; a natural next
+increment would extend that test with a `testcontainers/modules/kafka`
+broker, mirroring CRM's.
