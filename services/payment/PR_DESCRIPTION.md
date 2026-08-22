@@ -261,15 +261,31 @@ or race on the same `PaymentInstruction`.
 against a live Colima Docker daemon on this machine — both passed
 (~1.1–1.4s each), no leftover containers.
 
+## Follow-up: Kafka outbox publisher
+
+`internal/relay` (new, ported near-verbatim from `services/las`/
+`services/crm`) — `Publisher.PublishUnpublished` reads a batch of
+unpublished outbox rows via `outbox.Reader`, writes each to its own
+topic on a shared `*kafkago.Writer` (every `payment.*` event type
+shares one `Writer`; `Topic` is deliberately left unset on it since
+kafka-go rejects a Writer with both a fixed `Topic` and per-message
+topics), and only marks a row published after the Kafka write succeeds
+— nothing is marked published if the write fails, so a crash or broker
+outage between the two just means the same rows are safely retried on
+the next poll (at-least-once, matching every other topic in this
+system). 5 unit tests against fake reader/writer doubles, ported from
+the identical pattern already proven in `services/las`/`services/crm`.
+
+Wired into `cmd/payment-service/main.go`: `PAYMENT_SERVICE_KAFKA_BROKERS`
+(comma-separated, required) builds the `*kafkago.Writer`;
+`runOutboxRelay` polls on `PAYMENT_SERVICE_OUTBOX_POLL_INTERVAL`
+(default 2s) in a background goroutine for the process lifetime,
+logging but never treating a publish error as fatal.
+
 ## Still not started
 
-- **Live Kafka outbox publisher** (`internal/relay`) — the
-  transactional outbox write is complete and now proven live against
-  real Postgres; nothing yet delivers those rows to a broker. Same
-  boundary party/CRM/GL/LAS each drew before their own relay-wiring
-  follow-up.
 - **A live Payment↔LAS cross-service integration** — every test in this
-  repo, including the new integration test above, still uses
+  repo, including the integration test above, still uses
   `accountclient.Fake`.
 
 ## Unit tests: 49 tests, all passing under `go test -race`
