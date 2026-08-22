@@ -1,0 +1,106 @@
+name: Payment Execution CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/payment/**"
+      - "specs/openapi/payment-execution.yaml"
+      - "specs/asyncapi/payment-execution-events.yaml"
+      - "specs/schemas/payment-instruction.schema.json"
+      - ".github/workflows/payment-ci.yml"
+  pull_request:
+    paths:
+      - "services/payment/**"
+      - "specs/openapi/payment-execution.yaml"
+      - "specs/asyncapi/payment-execution-events.yaml"
+      - "specs/schemas/payment-instruction.schema.json"
+      - ".github/workflows/payment-ci.yml"
+
+defaults:
+  run:
+    working-directory: services/payment
+
+# golang-migrate CLI version pinned for reproducibility -- kept in sync
+# with party-ci.yml/crm-ci.yml/gl-ci.yml/las-ci.yml's pinned version.
+env:
+  MIGRATE_VERSION: v4.19.1
+
+jobs:
+  build-test:
+    name: Build, vet, unit tests (incl. -race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/payment/go.mod
+          cache-dependency-path: services/payment/go.sum
+      - run: go build ./...
+      - run: go vet ./...
+      - name: gofmt check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+      - run: go test ./... -v
+      # -race matters here because reconciliation/inbound sweeps and
+      # concurrent disbursement submissions must never double-post or
+      # race on the same PaymentInstruction -- same rationale as
+      # gl-ci.yml/las-ci.yml.
+      - run: go test -race ./...
+
+  migrations:
+    name: Migration runner (up / down / up)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: payment
+          POSTGRES_PASSWORD: payment
+          POSTGRES_DB: payment
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://payment:payment@localhost:5432/payment?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/payment/go.mod
+          cache-dependency-path: services/payment/go.sum
+      - name: Put $(go env GOPATH)/bin on PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Install golang-migrate CLI
+        run: go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@${{ env.MIGRATE_VERSION }}
+      - name: migrate up (from empty database)
+        run: make migrate-up
+      - name: migrate version
+        run: make migrate-version
+      - name: migrate down (verify every down migration actually reverses cleanly)
+        run: make migrate-down
+      - name: migrate up again (verify re-applying from clean is still correct)
+        run: make migrate-up
+
+  integration-test:
+    name: Integration test (live Postgres via testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/payment/go.mod
+          cache-dependency-path: services/payment/go.sum
+      # ubuntu-latest runners ship Docker pre-installed and running --
+      # no DOCKER_HOST/socket overrides needed here (those are only
+      # required for local Colima setups; see PR_DESCRIPTION.md).
+      - run: make test-integration

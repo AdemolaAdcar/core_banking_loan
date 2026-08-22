@@ -210,22 +210,67 @@ pass's ACH adapter surfaced, each with where it's enforced in code:
    interface-level sweeps (`RunReconciliationSweep`,
    `ReceiveInboundPayments`).
 
-## What's explicitly out of scope, flagged rather than silently worked around
+## Follow-up: migration runner, integration test, and CI
 
-Same discipline every other service in this repo has followed:
+Closes the same gap already closed for `services/party`, `services/crm`,
+`services/gl`, and `services/las`: `golang-migrate` CLI (pinned
+`v4.19.1`) verified against a disposable Postgres — `up` (from empty, 5
+application tables plus `golang-migrate`'s own `schema_migrations`) /
+`version` / `down 1` (clean removal back to just `schema_migrations`) /
+`up` again (clean reapply) — all confirmed locally.
 
-- **No live Kafka outbox publisher** (`internal/relay`) — the
-  transactional outbox write (`payment.disbursement.confirmed`,
-  `payment.disbursement.failed`, `payment.inbound.received`) is
-  complete and unit-tested; nothing yet delivers those rows to a
-  broker. Same first-pass boundary party/CRM/GL/LAS each drew before
-  their own follow-up phase.
-- **Migration runner verification, integration test, CI** — not run in
-  this pass; `Makefile` targets exist (`migrate-up`/`down`/`version`,
-  `test-integration`) but `internal/integration/` doesn't exist yet.
-- **`PAYMENT_SERVICE_ACCOUNT_BASE_URL` (AccountAPI/LAS) is real HTTP**,
-  but nothing in this repo runs a live cross-service call between the
-  two services yet — every service test uses `accountclient.Fake`.
+**Integration test** (`internal/integration/integration_test.go`, build
+tag `integration`, new) exercises the full write path against a real
+Postgres for the first time — nothing before this had ever actually run
+`migrations/0001_init.up.sql` or exercised `internal/store/postgres`'s
+real SQL, including its `payment_instructions` `ON CONFLICT` upsert.
+AccountAPI (LAS) is **not** live in this test — `accountclient.Fake`
+stands in for it, exactly as it does in every `internal/service` unit
+test, since no live Payment↔LAS cross-service integration exists in
+this repo yet:
+
+- Initiates a disbursement through the real SQL path, confirms the
+  idempotent replay resolves through the database's own primary-key
+  lookup, not just an in-memory map.
+- Runs a reconciliation sweep against the real database, confirming the
+  `Submitted -> Executed` transition actually persists via the UPDATE
+  branch of the `ON CONFLICT` upsert, and that a
+  `payment.disbursement.confirmed` row lands in the real `outbox` table.
+- Receives an inbound payment, confirms the `inbound_cursors` table
+  persists the cursor correctly; then processes a rail-reported return
+  for that same payment, confirming the compensating `ReverseRepayment`
+  call fires and the instruction's status persists as `Returned`.
+- Files an unmatched confirmation, confirms the row lands in the real
+  `reconciliation_exceptions` table with `kind = 'UNMATCHED_CONFIRMATION'`.
+- **`payment_app`'s GRANTs, verified live for the first time**: confirms
+  a `DELETE` against `payment_instructions` is rejected — the migration
+  documents "no DELETE grant on any table," previously asserted only by
+  reading the SQL, never exercised against a real Postgres. Not a
+  ledger-immutability invariant the way GL's is (this service's tables
+  are ordinary mutable entities with UPDATE granted) — it only proves
+  rows can't be silently deleted.
+
+**CI**: `.github/workflows/payment-ci.yml` (new), scoped to
+`services/payment/**` and the Payment Execution specs. Same three-job
+shape as `party-ci.yml`/`crm-ci.yml`/`gl-ci.yml`/`las-ci.yml`, with
+`build-test` also running `go test -race ./...` — reconciliation/inbound
+sweeps and concurrent disbursement submissions must never double-post
+or race on the same `PaymentInstruction`.
+
+**Verified for real, not just written**: ran the integration test twice
+against a live Colima Docker daemon on this machine — both passed
+(~1.1–1.4s each), no leftover containers.
+
+## Still not started
+
+- **Live Kafka outbox publisher** (`internal/relay`) — the
+  transactional outbox write is complete and now proven live against
+  real Postgres; nothing yet delivers those rows to a broker. Same
+  boundary party/CRM/GL/LAS each drew before their own relay-wiring
+  follow-up.
+- **A live Payment↔LAS cross-service integration** — every test in this
+  repo, including the new integration test above, still uses
+  `accountclient.Fake`.
 
 ## Unit tests: 49 tests, all passing under `go test -race`
 
